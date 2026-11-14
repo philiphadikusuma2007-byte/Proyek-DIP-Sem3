@@ -1,0 +1,9 @@
+contoh1.png 5
+contoh2.png 6
+contoh3.png 2
+contoh1_gelap.png 5
+contoh1_terang.png 5
+contoh1_kontrasrendah.png 5
+contoh1_saltpepper.png 5
+contoh1_gaussian.png 5
+contoh1_sinus.png 5
