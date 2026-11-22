@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Visualisasi Interaktif Morfologi Citra</title>
+<style>
+  :root{
+    --bg:#f7f8fc; --panel:#fff; --text:#1f2937; --muted:#6b7280; --accent:#2563eb;
+    --good:#16a34a; --warn:#d97706; --zero:#e5e7eb; --border:#d1d5db;
+  }
+  body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:1400px;margin:0 auto;padding:20px}
+  h1,h2,h3{margin:0 0 12px 0} p{line-height:1.5}.lead{color:var(--muted);margin-bottom:18px}
+  .grid2{display:grid;grid-template-columns:380px 1fr;gap:18px;align-items:start}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .controls .section{margin-bottom:16px} label{font-weight:bold;font-size:14px}
+  select,button{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:white}
+  button{cursor:pointer;margin:3px 4px 3px 0}.small{font-size:12px;color:var(--muted)}
+  .board{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:18px}
+  .board3{display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:18px}
+  .titlebar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
+  .matrix{display:grid;gap:3px;justify-content:start;margin-bottom:8px}
+  .cell{width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid #cbd5e1;font-weight:bold;user-select:none}
+  .cell.input{cursor:pointer}.cell.zero{background:var(--zero);color:#4b5563}.cell.one{background:#dbeafe;color:#1d4ed8}
+  .cell.activeSE{outline:3px solid var(--warn)}.cell.focusCell{outline:3px solid var(--good)}.cell.hit{background:#fde68a !important;color:#92400e}.cell.dim{opacity:.45}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:#fff}
+  .dot{width:14px;height:14px;border-radius:4px;border:1px solid #cbd5e1}
+  .explain{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:12px;line-height:1.6}
+  .math{font-family:"Courier New",monospace;background:#eef2ff;padding:2px 6px;border-radius:6px}
+  .keterangan{margin-top:8px;background:#f9fafb;border-left:4px solid var(--accent);padding:10px 12px;font-size:14px}
+  .badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;margin-left:6px}
+  .stageLabel{font-weight:bold;color:#111827;margin-bottom:6px}
+  .footer{margin-top:18px;color:var(--muted);font-size:12px}
+  .cell.pending{background:#fff!important;color:#9ca3af;border-style:dashed}
+  .cell.current{outline:4px solid #dc2626!important;outline-offset:1px;box-shadow:0 0 0 3px #fecaca}
+  .cell.sourceCenter{outline:3px solid #dc2626!important;outline-offset:1px}
+  .cell.seTouched{background:#fde68a!important;color:#78350f}
+  .stepbar{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin:12px 0}
+  .stepbar button{font-weight:600}
+  .stepbar input{width:100%;accent-color:#2563eb}
+  .stepstatus{padding:9px;background:#eff6ff;border-radius:8px;margin:8px 0;font-size:14px}
+  .mono{font-family:"Courier New",monospace;} ul{padding-left:18px;margin:6px 0}
+  @media(max-width:1100px){.grid2{grid-template-columns:1fr}.board,.board3{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Visualisasi Interaktif Morfologi Citra</h1>
+  <p class="lead">Klik sel pada matriks input untuk mengubah <b>0</b> / <b>1</b>. Pilih operasi morfologi dan bentuk <i>structuring element</i> (SE). Klik salah satu sel pada matriks hasil untuk melihat <b>cara menghitungnya</b>.</p>
+  <div class="grid2">
+    <div class="panel controls">
+      <h2>Kontrol</h2>
+      <div class="section">
+        <label for="operation">Operasi</label><br>
+        <select id="operation">
+          <option value="dilation">Dilasi</option>
+          <option value="erosion">Erosi</option>
+          <option value="opening">Opening (Erosi lalu Dilasi)</option>
+          <option value="closing">Closing (Dilasi lalu Erosi)</option>
+        </select>
+      </div>
+      <div class="section">
+        <label for="seType">Structuring Element (SE)</label><br>
+        <select id="seType">
+          <option value="horizontal">Horizontal [1 1 1]</option>
+          <option value="vertical">Vertikal</option>
+          <option value="cross">Empat arah (+)</option>
+          <option value="full">3×3 penuh</option>
+        </select>
+      </div>
+      <div class="section">
+        <label>Preset matriks</label><br>
+        <button onclick="loadPreset('block')">Blok 3×3</button>
+        <button onclick="loadPreset('noise')">Blok + noise</button>
+        <button onclick="loadPreset('gap')">Garis terputus</button>
+        <button onclick="loadPreset('bridge')">Jembatan tipis</button>
+        <button onclick="loadPreset('empty')">Kosong</button>
+      </div>
+      <div class="section">
+        <label>Aksi cepat</label><br>
+        <button onclick="clearGrid()">Reset ke nol</button>
+        <button onclick="invertGrid()">Balik 0/1</button>
+      </div>
+      <div class="section">
+        <h3>Aturan singkat</h3>
+        <div class="explain" id="ruleBox"></div>
+      </div>
+      <div class="section">
+        <h3>Structuring Element aktif</h3>
+        <div id="seContainer"></div>
+      </div>
+      <div class="keterangan">
+        <b>Catatan penting:</b><br>
+        Ini <u>bukan</u> perkalian matriks, <u>bukan</u> dot product, dan <u>bukan</u> convolution.<br>
+        Dalam morfologi biner:
+        <ul>
+          <li><b>Dilasi</b>: output = 1 jika <b>minimal satu</b> posisi aktif SE mengenai piksel 1.</li>
+          <li><b>Erosi</b>: output = 1 jika <b>semua</b> posisi aktif SE mengenai piksel 1.</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="panel" style="margin-bottom:18px;border:2px solid #93c5fd">
+        <h2>Jalankan Perhitungan Piksel demi Piksel</h2>
+        <p class="small">Pilih sel output secara langsung, atau jalankan pemindaian dari kiri ke kanan dan atas ke bawah. Kotak merah menunjukkan <b>piksel output yang sedang dihitung</b>, area kuning menunjukkan <b>piksel input yang diperiksa SE</b>.</p>
+        <div class="stepbar">
+          <button id="prevStep" onclick="moveStep(-1)">◀ Sebelumnya</button>
+          <button id="nextStep" onclick="moveStep(1)">Berikutnya ▶</button>
+          <button id="playBtn" onclick="togglePlay()">▶ Putar otomatis</button>
+          <button onclick="resetSteps()">↺ Ulang dari awal</button>
+          <label for="speed">Kecepatan</label>
+          <select id="speed" onchange="restartPlayback()"><option value="1500">Lambat (1,5 detik)</option><option value="750">Normal</option><option value="300">Cepat</option></select>
+        </div>
+        <input aria-label="Posisi langkah" type="range" id="stepRange" min="0" max="48" value="0" oninput="setStep(Number(this.value))" style="width:100%;accent-color:#2563eb"/>
+        <div class="stepstatus" id="progressText"></div>
+        <div class="stepbar">
+          <label for="stageSelect">Tahap yang ditelusuri:</label>
+          <select id="stageSelect" onchange="setStage(Number(this.value))"><option value="0">Tahap pertama</option><option value="1">Tahap kedua</option></select>
+          <label for="rowSelect">Baris:</label>
+          <select id="rowSelect" onchange="jumpToCell()"></select>
+          <label for="colSelect">Kolom:</label>
+          <select id="colSelect" onchange="jumpToCell()"></select>
+          <button onclick="jumpToCell()">Pilih piksel</button>
+        </div>
+        <div class="legend"><span class="chip">🔴 Sel output aktif</span><span class="chip">🟨 Area SE di input</span><span class="chip">🔵 Hasil yang sudah dihitung</span><span class="chip">⬜ Belum dihitung</span></div>
+      </div>
+      <div class="board3">
+        <div class="panel">
+          <div class="titlebar"><h2>1) Matriks Input</h2><span class="badge">klik untuk ubah nilai</span></div>
+          <div id="inputGrid"></div>
+          <div class="legend">
+            <span class="chip"><span class="dot" style="background:#e5e7eb"></span>0 = background</span>
+            <span class="chip"><span class="dot" style="background:#dbeafe"></span>1 = objek</span>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="titlebar"><h2>2) Tahap Antara</h2><span class="badge" id="stage1Badge">langsung hasil</span></div>
+          <div id="stage1Grid"></div>
+          <div class="small" id="stage1Text"></div>
+        </div>
+        <div class="panel">
+          <div class="titlebar"><h2>3) Hasil Akhir</h2><span class="badge">klik sel untuk analisis</span></div>
+          <div id="outputGrid"></div>
+          <div class="small" id="outputText"></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:18px;">
+        <div class="titlebar"><h2>Analisis Sel yang Dipilih</h2><span class="badge" id="selectedCellBadge">belum ada</span></div>
+        <div class="board">
+          <div>
+            <div class="stageLabel" id="analysisSourceLabel">Lingkungan yang dihitung</div>
+            <div id="analysisNeighborhood"></div>
+            <div class="small">Sel kuning = posisi yang diperiksa oleh SE. Garis hijau = sel output yang sedang dihitung.</div>
+          </div>
+          <div>
+            <div class="explain" id="analysisText">Klik salah satu sel pada matriks hasil untuk melihat langkah perhitungannya.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:18px;">
+        <h2>Langkah berpikir saat menghitung manual</h2>
+        <ol>
+          <li>Pilih satu sel output yang ingin dihitung.</li>
+          <li>Letakkan <b>titik tengah SE</b> di atas sel itu.</li>
+          <li>Lihat hanya posisi yang bernilai 1 pada SE.</li>
+          <li>Ambil nilai input pada posisi-posisi tersebut.</li>
+          <li>Jika <b>Dilasi</b> → tanyakan: <i>apakah ada minimal satu nilai 1?</i><br>
+              Jika <b>Erosi</b> → tanyakan: <i>apakah semua nilai 1?</i></li>
+          <li>Tulis hasilnya ke matriks output.</li>
+          <li>Ulangi untuk semua posisi.</li>
+        </ol>
+      </div>
+      <div class="footer">Asumsi batas luar matriks = 0.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const rows = 7, cols = 7;
+let grid = [];
+let selected = {r:0,c:0};
+let currentStep = 0, currentStage = 0, playTimer = null;
+const isTwoStage = op => op === 'opening' || op === 'closing';
+function stopPlay(){if(playTimer!==null){clearInterval(playTimer);playTimer=null;}document.getElementById('playBtn').textContent='▶ Putar otomatis';}
+function setStep(k){currentStep=Math.max(0,Math.min(rows*cols-1,k));selected={r:Math.floor(currentStep/cols),c:currentStep%cols};updateAll();}
+function moveStep(delta){if(delta>0 && currentStep===rows*cols-1 && isTwoStage(document.getElementById('operation').value) && currentStage===0){currentStage=1;setStep(0);return;}if(delta<0 && currentStep===0 && currentStage===1){currentStage=0;setStep(rows*cols-1);return;}setStep(currentStep+delta);}
+function setStage(i){currentStage=i;setStep(0);}
+function resetSteps(){stopPlay();currentStage=0;setStep(0);}
+function jumpToCell(){let r=Number(document.getElementById('rowSelect').value)-1,c=Number(document.getElementById('colSelect').value)-1;setStep(r*cols+c);}
+function togglePlay(){if(playTimer!==null){stopPlay();return;}document.getElementById('playBtn').textContent='⏸ Jeda';playTimer=setInterval(()=>{const op=document.getElementById('operation').value;if(currentStep===rows*cols-1 && (!isTwoStage(op)||currentStage===1)){stopPlay();return;}moveStep(1);},Number(document.getElementById('speed').value));}
+function restartPlayback(){if(playTimer!==null){stopPlay();togglePlay();}}
+
+
+function createZeroGrid(){ return Array.from({length: rows}, ()=>Array(cols).fill(0)); }
+function cloneGrid(g){ return g.map(row=>row.slice()); }
+
+function getSE(type){
+  if(type === "horizontal") return [[0,0,0],[1,1,1],[0,0,0]];
+  if(type === "vertical") return [[0,1,0],[0,1,0],[0,1,0]];
+  if(type === "cross") return [[0,1,0],[1,1,1],[0,1,0]];
+  return [[1,1,1],[1,1,1],[1,1,1]];
+}
+function getCell(g,r,c){ if(r<0 || c<0 || r>=rows || c>=cols) return 0; return g[r][c]; }
+
+function computeCell(baseGrid, r, c, se, op){
+  const vals = []; const coords = [];
+  for(let i=0;i<3;i++){
+    for(let j=0;j<3;j++){
+      if(se[i][j]===1){
+        const rr = r + (i-1), cc = c + (j-1);
+        vals.push(getCell(baseGrid, rr, cc));
+        coords.push([rr,cc]);
+      }
+    }
+  }
+  if(op === "dilation"){
+    return {value: vals.some(v=>v===1) ? 1 : 0, vals, coords};
+  } else {
+    return {value: vals.every(v=>v===1) ? 1 : 0, vals, coords};
+  }
+}
+
+function applyBasic(baseGrid, se, op){
+  const out = createZeroGrid(); const details = [];
+  for(let r=0;r<rows;r++){
+    details[r] = [];
+    for(let c=0;c<cols;c++){
+      const res = computeCell(baseGrid, r, c, se, op);
+      out[r][c] = res.value;
+      details[r][c] = res;
+    }
+  }
+  return {grid: out, details};
+}
+
+function applyOperation(input, op, se){
+  if(op === "dilation"){
+    const a = applyBasic(input, se, "dilation");
+    return {stage1Grid: cloneGrid(input), stage1Label:"Tidak ada tahap antara khusus. Hasil langsung dihitung dari input dengan aturan dilasi.",
+      outGrid:a.grid, outDetails:a.details, sourceForAnalysis:cloneGrid(input), sourceDetailsForAnalysis:a.details, analysisSourceName:"Input → Hasil Dilasi"};
+  }
+  if(op === "erosion"){
+    const a = applyBasic(input, se, "erosion");
+    return {stage1Grid: cloneGrid(input), stage1Label:"Tidak ada tahap antara khusus. Hasil langsung dihitung dari input dengan aturan erosi.",
+      outGrid:a.grid, outDetails:a.details, sourceForAnalysis:cloneGrid(input), sourceDetailsForAnalysis:a.details, analysisSourceName:"Input → Hasil Erosi"};
+  }
+  if(op === "opening"){
+    const first = applyBasic(input, se, "erosion");
+    const second = applyBasic(first.grid, se, "dilation");
+    return {stage1Grid:first.grid, stage1Label:"Tahap antara = hasil erosi. Lalu tahap ini didilasi untuk menghasilkan opening.",
+      outGrid:second.grid, outDetails:second.details, sourceForAnalysis:first.grid, sourceDetailsForAnalysis:second.details, analysisSourceName:"Tahap antara (erosi) → Hasil Opening"};
+  }
+  const first = applyBasic(input, se, "dilation");
+  const second = applyBasic(first.grid, se, "erosion");
+  return {stage1Grid:first.grid, stage1Label:"Tahap antara = hasil dilasi. Lalu tahap ini dierosi untuk menghasilkan closing.",
+    outGrid:second.grid, outDetails:second.details, sourceForAnalysis:first.grid, sourceDetailsForAnalysis:second.details, analysisSourceName:"Tahap antara (dilasi) → Hasil Closing"};
+}
+
+function renderMatrix(containerId, data, opts={}){
+  const container = document.getElementById(containerId);
+  container.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "matrix";
+  div.style.gridTemplateColumns = `repeat(${cols}, 36px)`;
+  const selCoords = new Set((opts.highlightCoords || []).map(([r,c])=>`${r},${c}`));
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      const cell = document.createElement("div");
+      cell.className = "cell " + (data[r][c] ? "one":"zero");
+      if(opts.isInput) cell.classList.add("input");
+      if(opts.dimNonSelected && !selCoords.has(`${r},${c}`) && !(opts.focusCell && opts.focusCell.r===r && opts.focusCell.c===c)) cell.classList.add("dim");
+      if(selCoords.has(`${r},${c}`)) cell.classList.add("hit");
+      if(opts.focusCell && opts.focusCell.r===r && opts.focusCell.c===c) cell.classList.add("focusCell");
+      cell.textContent = data[r][c];
+      if(opts.isInput){ cell.onclick = ()=>{ grid[r][c] = grid[r][c] ? 0 : 1; updateAll(); }; }
+      if(opts.onCellClick){ cell.style.cursor = "pointer"; cell.onclick = ()=>opts.onCellClick(r,c); }
+      div.appendChild(cell);
+    }
+  }
+  container.appendChild(div);
+}
+
+function renderSE(type){
+  const se = getSE(type);
+  const wrap = document.getElementById("seContainer");
+  wrap.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "matrix";
+  div.style.gridTemplateColumns = "repeat(3, 36px)";
+  for(let i=0;i<3;i++){
+    for(let j=0;j<3;j++){
+      const cell = document.createElement("div");
+      cell.className = "cell " + (se[i][j] ? "one":"zero");
+      if(se[i][j]) cell.classList.add("activeSE");
+      cell.textContent = se[i][j];
+      div.appendChild(cell);
+    }
+  }
+  wrap.appendChild(div);
+}
+
+function loadPreset(name){
+  const g = createZeroGrid();
+  if(name === "block"){ for(let r=2;r<=4;r++) for(let c=2;c<=4;c++) g[r][c]=1; }
+  else if(name === "noise"){ for(let r=2;r<=4;r++) for(let c=1;c<=3;c++) g[r][c]=1; g[1][5]=1; g[5][5]=1; }
+  else if(name === "gap"){ g[3][1]=1; g[3][2]=1; g[3][4]=1; g[3][5]=1; }
+  else if(name === "bridge"){ for(let r=2;r<=4;r++) for(let c=1;c<=2;c++) g[r][c]=1; for(let r=2;r<=4;r++) for(let c=4;c<=5;c++) g[r][c]=1; g[3][3]=1; }
+  stopPlay();grid = g; currentStep=0;currentStage=0;selected={r:0,c:0}; updateAll();
+}
+function clearGrid(){stopPlay(); grid = createZeroGrid(); currentStep=0;currentStage=0;selected={r:0,c:0}; updateAll(); }
+function invertGrid(){ for(let r=0;r<rows;r++){ for(let c=0;c<cols;c++) grid[r][c] = grid[r][c] ? 0 : 1; } updateAll(); }
+
+function seqToText(vals){ return "[" + vals.join(", ") + "]"; }
+
+function updateRuleBox(op){
+  const el = document.getElementById("ruleBox");
+  if(op === "dilation") el.innerHTML = "<b>Dilasi</b>: output = 1 jika <u>minimal satu</u> posisi aktif SE mengenai piksel 1.<br>Cara pikir: <span class='math'>OR</span> atau <span class='math'>MAX</span>.";
+  else if(op === "erosion") el.innerHTML = "<b>Erosi</b>: output = 1 jika <u>semua</u> posisi aktif SE mengenai piksel 1.<br>Cara pikir: <span class='math'>AND</span> atau <span class='math'>MIN</span>.";
+  else if(op === "opening") el.innerHTML = "<b>Opening</b> = <span class='math'>Erosi → Dilasi</span>.<br>Biasanya membantu menghilangkan noise kecil atau sambungan tipis.";
+  else el.innerHTML = "<b>Closing</b> = <span class='math'>Dilasi → Erosi</span>.<br>Biasanya membantu menutup celah kecil atau menyambungkan bagian yang berdekatan.";
+}
+
+function updateAll(){
+  const op = document.getElementById('operation').value;
+  const seType=document.getElementById('seType').value;
+  const se=getSE(seType);
+  const res=applyOperation(grid,op,se);
+  const two=isTwoStage(op);
+  if(!two)currentStage=0;
+  const firstOp=op==='opening'?'erosion':op==='closing'?'dilation':op;
+  const secondOp=op==='opening'?'dilation':op==='closing'?'erosion':op;
+  const activeOp=currentStage===0?firstOp:secondOp;
+  const stageSource=currentStage===0?grid:res.stage1Grid;
+  const stageResult=currentStage===0?(two?res.stage1Grid:res.outGrid):res.outGrid;
+  const detail=computeCell(stageSource,selected.r,selected.c,se,activeOp);
+  const coords=detail.coords.filter(([r,c])=>r>=0&&r<rows&&c>=0&&c<cols);
+  renderSE(seType);updateRuleBox(op);
+  renderMatrix('inputGrid',grid, {isInput:true,highlightCoords:currentStage===0?coords:[],focusCell:currentStage===0?selected:null});
+  renderMatrix('stage1Grid',res.stage1Grid, {highlightCoords:currentStage===1?coords:[],focusCell:currentStage===1?selected:(currentStage===0&&two?selected:null),onCellClick:two?(r,c)=>{stopPlay();currentStage=0;setStep(r*cols+c);}:null});
+  renderMatrix('outputGrid',res.outGrid,{focusCell:currentStage===1||!two?selected:null,onCellClick:(r,c)=>{stopPlay();if(two)currentStage=1;setStep(r*cols+c);}});
+  // Overlay a partial result: positions not yet processed are deliberately left blank.
+  const targetId=currentStage===0&&two?'stage1Grid':'outputGrid';
+  const matrixContainer=document.getElementById(targetId).querySelector('.matrix');
+  [...matrixContainer.children].forEach((node,i)=>{if(i>currentStep){node.classList.add('pending');node.textContent='·';}if(i===currentStep){node.classList.add('current');}});
+  if(currentStage===1){ // stage one is complete during stage two
+    document.getElementById('stage1Text').textContent='Tahap pertama sudah lengkap. Area kuning adalah input SE untuk tahap kedua.';
+  }else{
+    document.getElementById('stage1Text').textContent=two?'Pilih tahap pertama untuk menghitung matriks ini sel demi sel.': 'Pada operasi tunggal, input ditampilkan ulang di sini.';
+  }
+  document.getElementById('outputText').textContent=two?'Hasil final dihitung pada tahap kedua. Klik sel untuk langsung menuju pemeriksaannya.':'Hasil ditampilkan bertahap sesuai piksel yang sedang diproses.';
+  document.getElementById('stage1Badge').textContent=two?('Tahap 1: '+(firstOp==='erosion'?'Erosi':'Dilasi')):'Input awal';
+  document.getElementById('analysisSourceLabel').textContent='Sumber perhitungan: '+(currentStage===0?'Input asli':'Hasil tahap pertama');
+  renderMatrix('analysisNeighborhood',stageSource,{highlightCoords:coords,focusCell:selected,dimNonSelected:true});
+  document.getElementById('selectedCellBadge').textContent=`Baris ${selected.r+1}, kolom ${selected.c+1}`;
+  const textMode=activeOp==='dilation'?'MAX / OR':'MIN / AND';
+  const reason=activeOp==='dilation'?(detail.value?'Ada minimal satu 1.':'Semua posisi aktif bernilai 0.'):(detail.value?'Semua posisi aktif bernilai 1.':'Ada setidaknya satu 0.');
+  const coordsText=detail.coords.map(([r,c],i)=>`<li>${r<0||c<0||r>=rows||c>=cols?'Di luar citra':`(${r+1}, ${c+1})`}: <b>${detail.vals[i]}</b></li>`).join('');
+  document.getElementById('analysisText').innerHTML=`<p><b>Tahap ${currentStage+1}: ${activeOp==='dilation'?'Dilasi':'Erosi'}</b></p><p>Piksel output yang diproses adalah <b>(${selected.r+1},${selected.c+1})</b>.</p><p>Nilai pada posisi SE: <b class="mono">[${detail.vals.join(', ')}]</b></p><p><b>${textMode} = ${detail.value}</b></p><p>${reason} Karena itu piksel output menjadi <b>${detail.value}</b>.</p><details><summary>Periksa koordinat setiap posisi SE</summary><ul>${coordsText}</ul></details>`;
+  document.getElementById('stepRange').value=currentStep;
+  document.getElementById('stageSelect').disabled=!two;
+  document.getElementById('stageSelect').value=currentStage;
+  document.getElementById('rowSelect').value=String(selected.r+1);
+  document.getElementById('colSelect').value=String(selected.c+1);
+  document.getElementById('progressText').innerHTML=`<b>${two?'Tahap '+(currentStage+1)+' dari 2 · ':''}Piksel ${currentStep+1} dari ${rows*cols}</b> — baris <b>${selected.r+1}</b>, kolom <b>${selected.c+1}</b>. Metode: <b>${textMode}</b>. Nilai yang ditulis: <b>${detail.value}</b>.`;
+}
+
+for(const id of ['rowSelect','colSelect']){const el=document.getElementById(id);for(let n=1;n<=7;n++){let opt=document.createElement('option');opt.value=String(n);opt.textContent=String(n);el.appendChild(opt);}}
+document.getElementById("operation").addEventListener("change",()=>{stopPlay();currentStage=0;setStep(0);});
+document.getElementById("seType").addEventListener("change",()=>{stopPlay();setStep(0);});
+grid = createZeroGrid();
+loadPreset('block');
+</script>
+</body>
+</html>
