@@ -1,0 +1,12 @@
+# nama_file | jumlah obat tersisa (dihitung manual dari foto)
+IMG_20261109_080312.jpg|6
+IMG_20261109_080320.jpg|5
+IMG_20261109_080332.jpg|0
+IMG_20261109_080346.jpg|4
+IMG_20261109_080352.jpg|4
+WhatsApp Image 2026-11-09 at 11.14.53 PM (1).jpeg|1
+WhatsApp Image 2026-11-09 at 11.14.53 PM.jpeg|2
+WhatsApp Image 2026-11-09 at 11.14.54 PM.jpeg|10
+WhatsApp Image 2026-11-09 at 11.14.55 PM (1).jpeg|1
+WhatsApp Image 2026-11-09 at 11.14.55 PM.jpeg|1
+WhatsApp Image 2026-11-09 at 11.18.23 PM.jpeg|10
