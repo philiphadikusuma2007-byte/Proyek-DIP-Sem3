@@ -1,128 +1,143 @@
 # =============================================================================
-# m02_enhancement.py  -  Materi 02 Image Enhancement (point operation)
-#   - histogram          p(r_k) = n_k / n
-#   - histogram equalization   s_k = sum_{j=0..k} p(r_j)
-#   - contrast stretching      garis lurus (r1,0) -> (r2,255)
-#   - gamma (versi slide)      T(r) = ((r - r1) / (r2 - r1)) ^ g
-#   - thresholding / binarisasi  (contrast stretching dengan r1 = r2)
-#   - graylevel slicing        tonjolkan satu rentang nilai
+# dip/m02_enhancement.py  -  Materi 02 Image Enhancement (Point Operation)
+#
+#   Point operation:  s = T(r)   (output hanya bergantung pada 1 piksel)
+#   - Histogram               p(r_k) = n_k / n
+#   - Contrast stretching     garis lurus (r1, 0) -> (r2, 255)
+#   - Thresholding            kasus khusus contrast stretching (r1 = r2)
+#   - Gamma correction        T(r) = ((r - r1) / (r2 - r1)) ^ g   (versi slide)
+#   - Histogram equalization  s_k = sum_{j=0..k} p(r_j)
+#   - Graylevel slicing       tonjolkan rentang graylevel tertentu
+#
+# Semua operasi titik dikerjakan lewat LUT (look-up table): tabel 256 nilai
+# T(0), T(1), ..., T(255) dihitung sekali, lalu setiap piksel r diganti lut[r].
+#
+# File ini TIDAK meng-import library apa pun.
 # =============================================================================
-import math
-import numpy as np
-
-from dip.dasar import potong_nilai
+from dip.dasar import akar
 
 
-def histogram(abu, mask=None):
-    # n_k = banyak piksel bernilai k (0..255). Bila mask diberikan,
-    # hanya piksel di dalam mask yang dihitung.
+def histogram(data, mask=None):
+    # n_k = banyak piksel bernilai k (k = 0..255). data harus int 0..255.
+    # Bila mask diberikan, hanya piksel dengan mask = 1 yang dihitung.
     hist = [0] * 256
-    nilai = potong_nilai(abu, 0, 255).astype(int)
     if mask is None:
-        daftar = nilai.ravel().tolist()
+        for v in data:
+            hist[v] += 1
     else:
-        daftar = nilai[mask > 0.5].tolist()
-    for v in daftar:
-        hist[v] += 1
+        for v, m in zip(data, mask):
+            if m:
+                hist[v] += 1
     return hist
 
 
-def probabilitas(hist):
-    # p(r_k) = n_k / n
-    n = 0
-    for i in range(256):
-        n += hist[i]
-    p = []
-    for i in range(256):
-        p.append(hist[i] / n)
-    return p
-
-
 def rata_dan_std(hist):
-    # mu = sum k p(k),  sigma^2 = sum (k - mu)^2 p(k)
-    p = probabilitas(hist)
-    rata = 0
-    for i in range(256):
-        rata += i * p[i]
-    variansi = 0
-    for i in range(256):
-        variansi += (i - rata) * (i - rata) * p[i]
-    return rata, math.sqrt(variansi)
+    # rata-rata  mu = sum k p(k);   simpangan baku sigma = sqrt(sum (k-mu)^2 p(k))
+    n = 0
+    total = 0
+    for k in range(256):
+        n += hist[k]
+        total += k * hist[k]
+    if n == 0:
+        return 0.0, 0.0
+    mu = total / n
+    var = 0.0
+    for k in range(256):
+        var += (k - mu) * (k - mu) * hist[k]
+    return mu, akar(var / n)
 
 
 def persentil(hist, bagian):
-    # nilai keabuan k di mana (bagian x 100)% piksel berada di bawahnya
-    # (dihitung dari jumlah kumulatif histogram). bagian=0.5 -> median.
+    # nilai k terkecil yang di bawahnya sudah ada (bagian x 100)% piksel
+    # (dari histogram kumulatif). bagian = 0.5 -> median.
     n = 0
-    for i in range(256):
-        n += hist[i]
+    for k in range(256):
+        n += hist[k]
     kumulatif = 0
-    for i in range(256):
-        kumulatif += hist[i]
+    for k in range(256):
+        kumulatif += hist[k]
         if kumulatif >= bagian * n:
-            return i
+            return k
     return 255
 
 
-def pakai_lut(img, lut):
-    # point operation s = T(r): setiap nilai r diganti lut[r]
-    tabel = np.array(lut)
-    nilai = potong_nilai(img, 0, 255).astype(int)
-    return tabel[nilai]
+def pakai_lut(data, lut):
+    # point operation s = T(r): setiap piksel r diganti lut[r]
+    return [lut[v] for v in data]
 
 
 def lut_stretching(r1, r2):
-    # Contrast stretching: r <= r1 -> 0, r >= r2 -> 255, di antaranya garis lurus
+    # Contrast stretching (slide 02):
+    #   r <= r1 -> 0,  r >= r2 -> 255,  di antaranya garis lurus
+    #   s = (r - r1) * 255 / (r2 - r1)
     lut = []
     for r in range(256):
         if r2 <= r1:
             s = r
         else:
-            s = (r - r1) * 255 / (r2 - r1)
+            s = (r - r1) * 255.0 / (r2 - r1)
         if s < 0:
             s = 0
         if s > 255:
             s = 255
-        lut.append(s)
+        lut.append(int(s + 0.5))
     return lut
 
 
 def lut_gamma(r1, r2, g):
-    # Gamma versi slide: T(r) = 0 (r < r1), ((r-r1)/(r2-r1))^g, 1 (r > r2)
+    # Gamma correction versi slide 02:
+    #   T(r) = 0 (r < r1);  ((r - r1)/(r2 - r1))^g (r1 <= r <= r2);  1 (r > r2)
     # g < 1 -> lebih terang, g > 1 -> lebih gelap. Dikali 255 (8 bit).
     lut = []
     for r in range(256):
         if r < r1:
-            s = 0
+            s = 0.0
         elif r > r2:
-            s = 1
+            s = 1.0
         else:
-            s = math.pow((r - r1) / (r2 - r1), g)
-        lut.append(255 * s)
+            s = ((r - r1) / (r2 - r1)) ** g
+        lut.append(int(255 * s + 0.5))
     return lut
 
 
 def lut_equalization(hist):
-    # Histogram equalization: s_k = sum_{j=0..k} p(r_j), lalu x 255 dibulatkan
-    p = probabilitas(hist)
+    # Histogram equalization (slide 02):
+    #   s_k = T(r_k) = sum_{j=0..k} p(r_j)   lalu dikali 255 dan dibulatkan
+    n = 0
+    for k in range(256):
+        n += hist[k]
     lut = []
     kumulatif = 0
     for k in range(256):
-        kumulatif += p[k]
-        lut.append(round(255 * kumulatif))
+        kumulatif += hist[k]
+        lut.append(int(255.0 * kumulatif / n + 0.5))
     return lut
 
 
-def threshold(gambar, t):
-    # binarisasi: 1 bila nilai > t, 0 bila tidak
-    return (gambar > t) * 1.0
+def threshold(data, t):
+    # Thresholding / binarisasi: 1 bila r > T, 0 bila tidak
+    return [1 if v > t else 0 for v in data]
 
 
-def graylevel_slicing(gambar, bawah, atas):
-    # slicing tanpa background: rentang [bawah..atas] -> 1, lainnya -> 0
-    return (gambar >= bawah) * (gambar <= atas) * 1.0
+def graylevel_slicing(data, bawah, atas):
+    # Graylevel slicing TANPA background: rentang [bawah..atas] -> 1, lainnya 0
+    return [1 if bawah <= v <= atas else 0 for v in data]
 
 
-def ke_8bit(a, maks):
-    # skala linear 0..maks -> 0..255 (supaya bisa dibuat histogram 256 level)
-    return potong_nilai(a * 255 / (maks + 0.001), 0, 255)
+def skala_8bit(data, bawah, atas):
+    # skala linear [bawah..atas] -> [0..255] (int), di luar rentang dijepit.
+    # Dipakai agar data apa pun (jarak warna, top-hat, ...) bisa dibuat
+    # histogram 256 level.
+    if atas <= bawah:
+        atas = bawah + 1
+    k = 255.0 / (atas - bawah)
+    hasil = []
+    for v in data:
+        s = (v - bawah) * k
+        if s < 0:
+            hasil.append(0)
+        elif s > 255:
+            hasil.append(255)
+        else:
+            hasil.append(int(s + 0.5))
+    return hasil

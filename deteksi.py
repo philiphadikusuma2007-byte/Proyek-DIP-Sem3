@@ -1,1287 +1,852 @@
 # =============================================================================
-# deteksi.py  -  MENGHITUNG SISA OBAT DI KEMASAN BLISTER DARI FOTO HP
-# Digital Image Processing murni: tanpa OpenCV / scipy / Machine Learning.
-# Semua rumus ditulis manual di folder dip/ (satu file per materi slide).
+# deteksi.py  -  MENGHITUNG SISA OBAT DI DALAM BLISTER DARI SEBUAH FOTO
 #
-# analisis(path) -> dict hasil (lihat kontrak: nama, jumlah, waktu, foto,
-#                   obat, ditolak, langkah)
+# PROGRAM UTAMA PENGOLAHAN CITRA. File ini dan folder dip/ TIDAK meng-import
+# library apa pun (tidak ada numpy, opencv, math, dll). Yang di-import hanya
+# modul buatan sendiri di folder dip/ (satu file per materi kuliah).
+# Tidak ada Machine Learning: semua keputusan memakai rumus dan aturan yang
+# bisa dijelaskan (threshold, morfologi, deskriptor region).
 #
-# Alur besar:
-#   A. Foto utuh diperkecil (sampling) -> cari AREA BLISTER (ROI)
-#   B. Blister dipotong dari foto asli -> perbaiki (restorasi + enhancement)
-#   C. Cari calon obat di dalam blister -> region growing -> saring dengan
-#      aturan bentuk & ukuran -> hitung -> gambar lingkaran
+# Masukan : lebar, tinggi, data (bytes R,G,B,R,G,B,... dari masukan.py)
+# Keluaran: dict hasil -> jumlah obat, posisi & bentuk setiap obat, region
+#           yang ditolak beserta alasannya, dan DAFTAR LANGKAH (gambar +
+#           rumus + penjelasan) untuk ditampilkan satu per satu di GUI.
+#
+# ALUR BESAR
+#   TAHAP A (foto utuh diperkecil)       -> di mana letak blister?
+#     A1 sampling  A2 YIQ & kroma  A3 warna latar + Otsu  A4 ROI blister
+#     A5 potong blister dari foto asli
+#   TAHAP B (potongan blister)           -> berapa obat yang masih ada?
+#     B1 restorasi  B2 grayscale & histogram  B3 tekstur (std lokal)
+#     B4 top-hat (lebih terang dari foil)  B5 beda warna dari foil
+#     B6 kandidat obat  B7 labeling + penilaian + region splitting
+#     B8 gabung belahan kapsul  B9 konsistensi ukuran
+#     B10 chain code & deskripsi bentuk  B11 hasil akhir
 # =============================================================================
-import math
-import time
-import numpy as np
-
-from dip.dasar import baca_gambar, perkecil, faktor_sampling, potong_nilai, ke_abu, koordinat
-from dip.m02_enhancement import (histogram, rata_dan_std, persentil, pakai_lut, lut_stretching,
-                                 lut_gamma, lut_equalization, graylevel_slicing, threshold, ke_8bit)
-from dip.m03_spasial import (konvolusi, kernel_mean, LOWPASS_32, filter_median3, per_kanal,
-                             std_lokal)
-from dip.m04_frekuensi import dft2, idft2, geser_tengah
-from dip.m05_warna import (rgb_ke_hsi, minimum_rgb, jarak_warna, jarak_dua_warna, median_warna, warna_rata,
-                           hsi_satu_warna, beda_hue, jarak_ke_abu)
-from dip.m06_restorasi import (cek_salt_pepper, estimasi_noise, cek_periodik, butterworth_notch,
-                               nilai_tengah)
-from dip.m08_segmentasi import sobel, otsu, label_region, region_terbesar, region_growing
-from dip.m09_representasi import (erosi, dilasi, opening, closing, isi_lubang, batas,
-                                  mask_dari_piksel, chain_code, keliling, jari_jari, kebundaran, momen_region,
-                                  jenis_bentuk)
+from dip.dasar import sampling, sampling_kotak, faktor_sampling, akar, nilai_tengah, ke_int
+from dip.m02_enhancement import histogram, rata_dan_std, skala_8bit
+from dip.m03_spasial import std_lokal, konvolusi3, median3, LOWPASS_32
+from dip.m05_warna import ke_abu, rgb_ke_hsi, median_warna, jarak_warna
+from dip.m06_restorasi import cek_salt_pepper, estimasi_noise
+from dip.m08_segmentasi import otsu, label_region, mask_dari_region
+from dip.m09_representasi import (opening, closing, dilasi, erosi, isi_lubang, momen, top_hat,
+                                  chain_code, keliling)
+from dip.dasar import PI, arctan2
 
 
 # ================================ PARAMETER ==================================
-UKURAN_KERJA     = 360    # sisi terpanjang foto utuh setelah sampling
-UKURAN_OBAT      = 450    # sisi terpanjang potongan blister
-MARGIN_POTONG    = 12     # px (gambar kecil) di sekeliling blister ikut dipotong
+UKURAN_A = 400          # sisi terpanjang foto utuh pada tahap A (cari blister)
+UKURAN_B = 640          # skala kerja tahap B: setara foto utuh 640 piksel
+PITA_TEPI = 25          # pita tepi foto = 1/25 sisi terpendek (dianggap latar)
+SKALA_KROMA = 60.0      # jarak kroma 0..60 dipetakan ke 0..255 untuk histogram
+SKALA_STD = 40.0        # std lokal 0..40 dipetakan ke 0..255
+SKALA_TOPHAT = 100.0    # top-hat 0..100 dipetakan ke 0..255
+JENDELA_STD = 5         # jendela simpangan baku lokal 5 x 5
 
-# restorasi & enhancement (06, 03, 02)
-BATAS_SALT       = 0.01   # > 1% piksel ekstrem beda jauh dari median -> salt & pepper
-BATAS_NOISE      = 6.0    # noise di patch datar > 6 -> lowpass
-BATAS_PUNCAK     = 100    # titik spektrum > 100x median spektrum -> noise periodik
-RADIUS_PUSAT     = 10     # frekuensi rendah (isi gambar) tidak dianggap noise
-RADIUS_NOTCH     = 9      # D0 Butterworth notch
-ORDE_NOTCH       = 2      # n Butterworth
-BATAS_STD        = 40     # std keabuan < 40 -> kontras rendah -> stretching
-BATAS_RENTANG    = 70     # rentang p1..p99 < 70 -> histogram sempit -> equalization
-BATAS_GELAP      = 70     # rata-rata < 70 -> terlalu gelap -> gamma 0.5
-BATAS_TERANG     = 185    # rata-rata > 185 -> terlalu terang -> gamma 2
+# restorasi (materi 06)
+BATAS_SALT = 0.01       # > 1% piksel impulse -> median filter
+BATAS_NOISE = 6.0       # noise patch datar > 6 -> lowpass 1/32
 
-# ROI blister (08, 09)
-JENDELA_TEKSTUR  = 7      # lowpass 7x7 untuk skor foil & kepadatan tepi
-CLOSING_ROI      = 13     # closing menyatukan foil blister
-OPENING_ROI      = 17     # opening besar memutus silau meja yang menempel
-PITA_TEPI_FOTO   = 6      # pita di tepi foto diabaikan
+# kandidat (materi 02, 05, 09)
+BATAS_FOIL = 0.85       # di top-hat, piksel lebih gelap dari 0.85 x foil dianggap = foil
+MIN_T_TOPHAT = 12.0     # threshold top-hat minimal (gray level)
+MIN_T_KROMA = 8.0       # threshold beda kroma minimal
+GELAP_BOLEH = 0.6       # beda warna hanya dihitung bila Y > 0.6 x foil ...
+JENUH_GELAP = 0.35      # ... atau sangat jenuh (S > 0.35) dan Y > 0.25 x foil
 
-# kulit / tangan / meja kayu (05, 08, 09)
-KULIT_H          = (5, 50)     # hue warna hangat (derajat): kulit, kayu
-KULIT_S          = 0.12        # saturasi minimal (bukan abu-abu / foil)
-KULIT_I          = 20          # tidak terlalu gelap
-OPENING_KULIT    = 5           # buang bintik & putus jembatan tipis
-PITA_KULIT       = 10          # region menyentuh pita 10 px di tepi foto
-MIN_KULIT        = 0.02        # region > 2% foto
-LEBAR_KULIT      = 5           # dilasi 5x5: pinggiran kulit ikut dibuang
+# penilaian region (materi 09)
+MIN_LUAS = 100          # region < 100 piksel (skala kerja) bukan obat
+MIN_LUAS_ROI = 0.0015   # ... atau < 0.15% luas blister
+MAKS_LUAS_ROI = 0.12    # satu obat tidak mungkin > 12% luas blister
+MIN_ISI = 0.82          # keterisian elips minimal (bentuk rapi)
+MAKS_LONJONG = 5.0      # kelonjongan maksimal
+LEBAR_CINCIN = 6        # lebar cincin pembanding di sekeliling region (px)
+MIN_DI_ROI = 0.6        # >= 60% cincin harus di dalam blister
+MAKS_CINCIN_FOIL = 20.0 # warna cincin harus mirip foil (beda kroma <= 20)
+BEDA_TERANG = 15        # obat putih: lebih terang >= 15 dari cincinnya ...
+TERANG_FOIL = 1.14      # ... dan >= 1.14 x kecerahan foil
+BEDA_KROMA = 10         # obat berwarna: beda kroma >= 10 dari cincinnya ...
+JENUH = 0.25            # ... boleh lebih gelap bila jenuh (S >= 0.25)
+KROMA_KUAT = 25         # ... atau warnanya sangat beda (>= 25)
+MIRIP_LATAR = 6.0       # kroma mirip latar (< 6) & tidak terang -> kantong kosong
+MAKS_TINGKAT = 3        # region splitting paling dalam 3 tingkat
 
-# calon obat (03, 05, 08)
-JENDELA_STD      = 5      # jendela std lokal (kehalusan)
-SKALA_STD        = 40     # std 40 -> 255
-BEDA_FOIL        = 40     # jarak warna ke foil > 40
-BEDA_MEJA        = 45     # jarak warna ke meja < 45 -> kantong kosong / meja
-BATAS_KILAU      = 235    # min(R,G,B) >= 235 = putih jenuh = pantulan cahaya
-LEBAR_SILAU      = 7      # zona silau = dilasi 7x7 dari titik jenuh
+# konsistensi ukuran (materi 09)
+KECIL_ACUAN = 0.4       # luas < 0.4 x acuan -> serpihan
+BESAR_ACUAN = 2.2       # luas > 2.2 x acuan -> bukan satu obat
 
-# penilaian calon (09)
-MIN_INTI         = 40     # region < 40 piksel diabaikan
-MAKS_LUAS_ROI    = 0.15   # calon > 15% luas blister = foil datar
-MIN_ISI          = 0.75   # luas / luas elips momen
-MAKS_LONJONG     = 4.0    # sumbu panjang / sumbu pendek
-LEBAR_CINCIN     = 6      # lebar cincin pembanding (px)
-MIN_DIKELILINGI  = 0.85   # >= 85% cincin harus di dalam blister
-BEDA_SEKITAR     = 30     # warna calon beda > 30 dari cincin sekitarnya
-MIN_TAJAM        = 60     # rata-rata Sobel di garis batas (tepi tegas)
-MAKS_CINCIN_MEJA = 0.40   # >= 40% cincin berwarna meja -> pantulan kantong kosong
-BATAS_ABU        = 30     # jarak warna ke sumbu abu-abu < 30 = tidak berwarna
-BEDA_HUE_MEJA    = 15     # hue calon beda < 15 derajat dari hue meja -> meja tembus plastik
-MIN_S_HUE        = 0.10   # hue hanya berarti bila saturasi >= 0.10
-PISAH_BERTINGKAT = (9, 13, 17)  # opening bertingkat memutus obat <-> foil datar
-
-# region growing (08)
-LANGKAH_TUMBUH   = 8      # maksimal 8 piksel ke luar
-BATAS_TUMBUH     = 50     # piksel ikut bila jarak warna ke obat < 50
-MAKS_TUMBUH      = 2.0    # tumbuh > 2x inti = bocor ke foil -> batal
-OPENING_PISAH    = 11     # opening 11x11 memutus sambungan tipis antar region
-
-# aturan akhir (09)
-MAKS_KILAU       = 0.90   # region >= 90% di zona silau -> pantulan
-MIN_LUAS_ROI     = 0.003  # obat minimal 0.3% luas blister
-BATAS_KECIL      = 0.35   # luas < 0.35 x obat terbesar -> serpihan
-BATAS_KECIL_MEDIAN = 0.5  # luas < 0.5 x median -> serpihan
-BATAS_DOBEL      = 1.60   # luas >= 1.6 x median -> round(luas / median) butir
-BEDA_DUA_WARNA   = 60     # 2 belahan beda warna > 60 -> kapsul
-JARAK_KAPSUL     = 5      # celah minimum (px) yang boleh antara 2 belahan kapsul
-KALI_CELAH_KAPSUL = 0.6   # celah maks = 0.6 x lebar belahan (bayangan/kilau di sambungan kapsul)
-MIN_LONJONG_BELAHAN = 1.5  # region awal harus sudah lonjong untuk dilengkapi jadi kapsul
-MAKS_BEDA_SUDUT  = 20     # sumbu kapsul hasil tumbuh searah region awal (derajat)
-MAKS_KALI_MEDIAN = 2.5   # luas > 2.5 x median -> bukan obat (tangan / foil); 2 butir menempel ~2x
-MIN_ISI_DOBEL    = 0.87   # 2 butir menempel hanya bila bentuk tetap kompak
+# kapsul
+WARNA_KAPSUL = 12       # belahan berwarna: beda kroma >= 12 atau S >= 0.25
+LONJONG_BULAT = 1.6     # kelonjongan < 1.6 -> bulat (kaplet/kapsul >= 2.4)
 
 
 # ============================== ALAT BANTU ===================================
-def buat_langkah(judul, materi, teknik, rumus, deskripsi, dipakai, jenis, gambar,
-                 hist=None, garis=None):
-    return {"judul": judul, "materi": materi, "teknik": teknik, "rumus": rumus,
-            "deskripsi": deskripsi, "dipakai": dipakai, "jenis": jenis, "gambar": gambar,
-            "histogram": hist, "garis": garis}
+class Konteks:
+    # wadah data potongan blister yang dipakai banyak fungsi
+    pass
 
 
-def bulat(angka, digit):
-    # angka -> teks dengan jumlah desimal tertentu
+def ganjil(x):
+    # ukuran structuring element harus ganjil (punya titik tengah)
+    x = int(x + 0.5)
+    if x < 1:
+        x = 1
+    return x if x % 2 == 1 else x + 1
+
+
+def bulat(x, digit=1):
+    # angka -> teks pendek untuk penjelasan
     if digit == 0:
-        return str(int(round(angka)))
-    return str(round(angka, digit))
+        return str(int(x + 0.5)) if x >= 0 else str(-int(-x + 0.5))
+    return str(round(x, digit))
 
 
-def gambar_lingkaran(img, cx, cy, r, warna, tebal):
-    # menggambar lingkaran: titik (cx + r cos t, cy + r sin t) diwarnai
-    tinggi = img.shape[0]
-    lebar = img.shape[1]
-    langkah_sudut = 720
-    for i in range(langkah_sudut):
-        t = 2 * math.pi * i / langkah_sudut
-        for d in range(tebal):
-            x = int(round(cx + (r + d) * math.cos(t)))
-            y = int(round(cy + (r + d) * math.sin(t)))
-            if y >= 0 and y < tinggi and x >= 0 and x < lebar:
-                img[y, x, 0] = warna[0]
-                img[y, x, 1] = warna[1]
-                img[y, x, 2] = warna[2]
+def kotak_lokal(piksel, r, w, h):
+    # kotak kecil di sekitar sekumpulan piksel (dengan margin r) + mask di
+    # dalam kotak. Morfologi dikerjakan di kotak ini saja supaya cepat.
+    xs = [i % w for i in piksel]
+    ys = [i // w for i in piksel]
+    x0 = max(min(xs) - r, 0)
+    y0 = max(min(ys) - r, 0)
+    x1 = min(max(xs) + r + 1, w)
+    y1 = min(max(ys) + r + 1, h)
+    bw = x1 - x0
+    bh = y1 - y0
+    m = [0] * (bw * bh)
+    for x, y in zip(xs, ys):
+        m[(y - y0) * bw + (x - x0)] = 1
+    return x0, y0, bw, bh, m
 
 
-# ================= LANGKAH PERBAIKAN (06 Restorasi, 02, 03, 04) ==============
-def perbaiki_gambar(img):
-    # Memeriksa kondisi gambar lalu MEMILIH sendiri filter yang perlu.
-    # Hasil: gambar yang sudah diperbaiki + catatan setiap pemeriksaan.
-    catatan = {}
-    abu = ke_abu(img)
-
-    # 1) salt & pepper -> median 3x3 (order-statistic filter)
-    salt = cek_salt_pepper(abu)
-    catatan["salt"] = salt
-    catatan["median"] = salt > BATAS_SALT
-    if catatan["median"]:
-        img = per_kanal(img, filter_median3)
-    abu = ke_abu(img)
-
-    # 2) noise periodik -> DFT + Butterworth notch reject
-    F, besar, puncak, tertinggi = cek_periodik(abu, RADIUS_PUSAT, BATAS_PUNCAK)
-    catatan["spektrum"] = besar
-    catatan["puncak"] = puncak
-    catatan["tertinggi"] = tertinggi
-    catatan["notch"] = len(puncak) > 0
-    if catatan["notch"]:
-        H = butterworth_notch(abu.shape[0], abu.shape[1], puncak, RADIUS_NOTCH, ORDE_NOTCH)
-        for c in range(3):
-            Fc = geser_tengah(dft2(img[:, :, c]))
-            img[:, :, c] = idft2(geser_tengah(Fc * H)).real
-        img = potong_nilai(img, 0, 255)
-    abu = ke_abu(img)
-
-    # 3) noise aditif diukur di patch datar -> lowpass (1/32)[1 3 1; 3 16 3; 1 3 1]
-    noise = estimasi_noise(abu)
-    catatan["noise"] = noise
-    catatan["lowpass"] = noise > BATAS_NOISE
-    if catatan["lowpass"]:
-        img = per_kanal(img, konvolusi, LOWPASS_32)
-    abu = ke_abu(img)
-    catatan["abu_bersih"] = abu
-    bersih = img.copy()        # bebas noise, intensitas masih asli
-
-    # 4) intensitas: equalization / stretching / gamma (02 Enhancement)
-    hist_awal = histogram(abu)
-    rata, std = rata_dan_std(hist_awal)
-    p1 = persentil(hist_awal, 0.01)
-    p99 = persentil(hist_awal, 0.99)
-    catatan["hist_awal"] = hist_awal
-    catatan["rata"] = rata
-    catatan["std"] = std
-    catatan["p1"] = p1
-    catatan["p99"] = p99
-    catatan["equalization"] = (p99 - p1) < BATAS_RENTANG
-    catatan["stretching"] = (not catatan["equalization"]) and std < BATAS_STD
-    if catatan["equalization"]:
-        img = per_kanal(img, pakai_lut, lut_equalization(hist_awal))
-    if catatan["stretching"]:
-        img = per_kanal(img, pakai_lut, lut_stretching(p1, p99))
-
-    rata_baru, std_baru = rata_dan_std(histogram(ke_abu(img)))
-    catatan["rata_baru"] = rata_baru
-    catatan["gamma"] = 1.0
-    if rata_baru < BATAS_GELAP:
-        catatan["gamma"] = 0.5
-    elif rata_baru > BATAS_TERANG:
-        catatan["gamma"] = 2.0
-    if catatan["gamma"] != 1.0:
-        img = per_kanal(img, pakai_lut, lut_gamma(0, 255, catatan["gamma"]))
-    catatan["hist_akhir"] = histogram(ke_abu(img))
-    return img, bersih, catatan
+def ke_global(daftar, x0, y0, bw, w):
+    # indeks kotak lokal -> indeks gambar
+    return [(y0 + q // bw) * w + x0 + q % bw for q in daftar]
 
 
-def daftar_perbaikan(catatan):
-    # nama filter yang dipakai (untuk ringkasan)
-    nama = []
-    if catatan["median"]:
-        nama.append("median 3x3")
-    if catatan["notch"]:
-        nama.append("DFT + Butterworth notch")
-    if catatan["lowpass"]:
-        nama.append("lowpass 1/32")
-    if catatan["equalization"]:
-        nama.append("histogram equalization")
-    if catatan["stretching"]:
-        nama.append("contrast stretching")
-    if catatan["gamma"] != 1.0:
-        nama.append("gamma " + str(catatan["gamma"]))
-    return nama
+def otsu_eta(nilai8):
+    # Otsu pada sekumpulan nilai 0..255. Selain T, dihitung juga
+    # eta = sigma_B^2 / sigma_total^2 (0..1): seberapa jelas dua kelas terpisah.
+    hist = [0] * 256
+    for v in nilai8:
+        hist[v] += 1
+    T = otsu(hist)
+    n = len(nilai8)
+    mu = sum(nilai8) / float(n)
+    var = sum((v - mu) ** 2 for v in nilai8) / n
+    a = [v for v in nilai8 if v <= T]
+    b = [v for v in nilai8 if v > T]
+    if var <= 0 or not a or not b:
+        return T, 0.0
+    ma = sum(a) / float(len(a))
+    mb = sum(b) / float(len(b))
+    sb = (len(a) / float(n)) * (len(b) / float(n)) * (ma - mb) ** 2
+    return T, sb / var
 
 
-# ===================== CARI BLISTER / ROI (05, 08, 09) =======================
-def cari_kulit(hue, saturasi, intensitas):
-    # Tangan (kulit) dan meja kayu = warna HANGAT (H 5..50 derajat) dengan
-    # saturasi sedang. Obat krem/oranye juga hangat, jadi warna saja tidak
-    # cukup: dipakai juga STRUKTUR. Tangan/meja = region BESAR yang
-    # menyentuh tepi foto (berlanjut ke luar blister). Obat selalu kecil
-    # dan dikelilingi blister.
-    tinggi = hue.shape[0]
-    lebar = hue.shape[1]
-    hangat = (hue >= KULIT_H[0]) * (hue <= KULIT_H[1])
-    warna = hangat * (saturasi >= KULIT_S) * (intensitas >= KULIT_I)
-    warna = opening(warna * 1.0, OPENING_KULIT)
-    _, daftar = label_region(warna)
-    kulit = np.zeros(hue.shape)
-    p = PITA_KULIT
+def kroma_yiq(R, G, B):
+    # YIQ (materi 05): Y = terang-gelap, I dan Q = warna.
+    # Kroma TERNORMALISASI c1 = 100 I / (Y + 20), c2 = 100 Q / (Y + 20):
+    # warna yang sama dengan terang berbeda (bayangan / lampu) tetap mirip.
+    # (+20 supaya piksel yang sangat gelap tidak meledak nilainya.)
+    Y = ke_abu(R, G, B)
+    c1 = [(0.596 * r - 0.275 * g - 0.321 * b) * 100.0 / (y + 20.0) for r, g, b, y in zip(R, G, B, Y)]
+    c2 = [(0.212 * r - 0.523 * g + 0.311 * b) * 100.0 / (y + 20.0) for r, g, b, y in zip(R, G, B, Y)]
+    return Y, c1, c2
+
+
+def langkah_baru(judul, materi, teknik, rumus, deskripsi, gambar, dipakai=True):
+    return {"judul": judul, "materi": materi, "teknik": teknik, "rumus": rumus,
+            "deskripsi": deskripsi, "gambar": gambar, "dipakai": dipakai}
+
+
+# ---- gambar untuk ditampilkan GUI (data mentah, GUI yang menggambar) ----
+def g_rgb(w, h, R, G, B):
+    return {"jenis": "rgb", "w": w, "h": h, "R": R, "G": G, "B": B}
+
+
+def g_abu(w, h, data8):
+    return {"jenis": "gray", "w": w, "h": h, "data": data8}
+
+
+def g_mask(w, h, mask):
+    return {"jenis": "mask", "w": w, "h": h, "data": [255 if v else 0 for v in mask]}
+
+
+def g_panas(w, h, data8, keterangan):
+    return {"jenis": "heat", "w": w, "h": h, "data": data8, "skala": keterangan}
+
+
+def g_hist(hist, garis, label, nama_garis="T"):
+    return {"jenis": "hist", "hist": hist, "garis": garis, "label": label, "nama_garis": nama_garis}
+
+
+def g_overlay(c, kelompok, redup=0.55):
+    # foto potongan diredupkan, lalu batas region (A - erosi(A), materi 09)
+    # diwarnai. kelompok = [(daftar_region, (r, g, b), isi_tipis), ...]
+    R = [int(v * redup) for v in c.R]
+    G = [int(v * redup) for v in c.G]
+    B = [int(v * redup) for v in c.B]
+    for daftar, warna, isi in kelompok:
+        for d in daftar:
+            x0, y0, bw, bh, m = kotak_lokal(d["piksel"], 1, c.w, c.h)
+            e = erosi(m, bw, bh, 3)
+            for q in range(bw * bh):
+                if not m[q]:
+                    continue
+                i = (y0 + q // bw) * c.w + x0 + q % bw
+                if not e[q]:
+                    R[i], G[i], B[i] = warna
+                elif isi:
+                    R[i] = (R[i] + warna[0]) // 2
+                    G[i] = (G[i] + warna[1]) // 2
+                    B[i] = (B[i] + warna[2]) // 2
+    return g_rgb(c.w, c.h, R, G, B)
+
+
+# ======================= TAHAP A : MENCARI BLISTER ===========================
+def mask_roi(w, h, c1, c2, R, G, B, acuan, skala):
+    # Piksel dianggap BUKAN LATAR bila warnanya cukup jauh dari warna latar:
+    #   jarak kroma  sqrt((c1-b1)^2 + (c2-b2)^2) > Tk     (beda warna)
+    #   ATAU jarak RGB Euclid ke warna latar > Tr          (beda terang)
+    # Lalu dirapikan dengan morfologi (materi 09):
+    #   opening -> buang bintik kecil, closing -> satukan foil yang terputus,
+    #   hole filling -> obat & kantong di dalam blister ikut menjadi ROI.
+    b1, b2, latar_rgb, tk, tr = acuan
+    jr = jarak_warna(R, G, B, latar_rgb)
+    roi = [1 if (((a - b1) ** 2 + (b - b2) ** 2) ** 0.5 > tk or d > tr) else 0
+           for a, b, d in zip(c1, c2, jr)]
+    roi = opening(roi, w, h, ganjil(5 * skala))
+    roi = closing(roi, w, h, ganjil(9 * skala))
+    roi = isi_lubang(roi, w, h)
+    return roi
+
+
+def tahap_a(lebar0, tinggi0, data, langkah):
+    # ---------------------------------------------------------------- A1
+    wa, ha, Ra, Ga, Ba, fa = sampling(lebar0, tinggi0, data, UKURAN_A)
+    na = wa * ha
+    langkah.append(langkah_baru(
+        "Foto asli & sampling", "01 Introduction to DIP I",
+        "Citra digital f(x,y) + sampling (digitisasi koordinat)",
+        "g(m,n) = [f(a,a) + f(a,b) + f(b,a) + f(b,b)] / 4,  blok " + str(fa) + " x " + str(fa),
+        "Foto dibaca sebagai matriks " + str(lebar0) + " x " + str(tinggi0) + " piksel, 3 kanal R, G, B "
+        "(8 bit, 0..255). Untuk MENCARI letak blister foto cukup kecil, jadi setiap blok " + str(fa) + " x " +
+        str(fa) + " piksel diwakili rata-rata 4 titik sampel -> " + str(wa) + " x " + str(ha) + " piksel. "
+        "Rata-rata 4 titik = lowpass kecil sebelum sampling sehingga noise dan pola halus foil tidak "
+        "menimbulkan aliasing.",
+        g_rgb(wa, ha, Ra, Ga, Ba)))
+
+    # ---------------------------------------------------------------- A2
+    Ya, c1a, c2a = kroma_yiq(Ra, Ga, Ba)
+    p = max(3, min(wa, ha) // PITA_TEPI)
+    pita = [1 if (i % wa) < p or (i % wa) >= wa - p or (i // wa) < p or (i // wa) >= ha - p else 0
+            for i in range(na)]
+    tepi = [i for i in range(na) if pita[i]]
+    b1 = nilai_tengah([c1a[i] for i in tepi])
+    b2 = nilai_tengah([c2a[i] for i in tepi])
+    latar_rgb = median_warna(Ra, Ga, Ba, tepi)
+    jk = [((a - b1) ** 2 + (b - b2) ** 2) ** 0.5 for a, b in zip(c1a, c2a)]
+    jk8 = skala_8bit(jk, 0, SKALA_KROMA)
+    langkah.append(langkah_baru(
+        "Ruang warna YIQ & kroma ternormalisasi", "05 Color Image Processing",
+        "RGB -> YIQ, kroma c1 = I/(Y+20), c2 = Q/(Y+20)",
+        "Y = 0.299R + 0.587G + 0.114B;  I = 0.596R - 0.275G - 0.321B;  Q = 0.212R - 0.523G + 0.311B",
+        "Pada YIQ, Y menyatakan terang-gelap sedangkan I dan Q menyatakan warna (slide 05). I dan Q "
+        "dibagi (Y + 20) supaya warna yang sama tetap mirip walaupun terkena bayangan atau lampu. "
+        "Latar (meja kayu, kain, kulit tangan) berwarna HANGAT, sedangkan foil blister dan obat "
+        "abu-abu/kebiruan. Warna latar diambil dari pita " + str(p) + " px di tepi foto (median): "
+        "RGB " + str(latar_rgb) + ", kroma (" + bulat(b1) + ", " + bulat(b2) + "). Gambar: jarak kroma "
+        "setiap piksel ke warna latar (terang = beda dari latar).",
+        g_panas(wa, ha, jk8, "jarak kroma ke latar (0..60)")))
+
+    # ---------------------------------------------------------------- A3
+    hist_k = histogram(jk8)
+    t_k = otsu(hist_k)
+    hist_r = histogram(skala_8bit(jarak_warna(Ra, Ga, Ba, latar_rgb), 0, 255))
+    t_r = otsu(hist_r)
+    acuan = (b1, b2, latar_rgb, t_k * SKALA_KROMA / 255.0, float(t_r))
+    langkah.append(langkah_baru(
+        "Threshold latar dengan Otsu", "02 Image Enhancement + 08 Image Segmentation",
+        "Histogram + thresholding, T dipilih otomatis dengan Otsu (Gonzalez)",
+        "p(r_k) = n_k / n;   T = argmax  w1(T) w2(T) [mu1(T) - mu2(T)]^2",
+        "Histogram jarak kroma ke latar mempunyai dua kelompok: latar (dekat 0) dan blister (jauh). "
+        "Threshold T dipilih dengan metode Otsu (buku Gonzalez, di luar slide): T yang membuat variansi "
+        "ANTAR-kelas terbesar. Otsu murni rumus statistik histogram, tidak ada data latih (bukan machine "
+        "learning). Hasil: T kroma = " + bulat(acuan[3]) + ". Dengan cara yang sama untuk jarak RGB "
+        "(Euclid, materi 02) didapat T = " + str(t_r) + ".",
+        g_hist(hist_k, t_k, "jarak kroma ke latar (0..255)")))
+
+    # ---------------------------------------------------------------- A4
+    roi_a = mask_roi(wa, ha, c1a, c2a, Ra, Ga, Ba, acuan, 1.0)
+    _, daftar = label_region(roi_a, wa, ha, 4)
+    pilih = []
     for d in daftar:
-        sentuh_tepi = d["y0"] < p or d["x0"] < p or d["y1"] >= tinggi - p or d["x1"] >= lebar - p
-        if sentuh_tepi and d["luas"] > MIN_KULIT * hue.size:
-            for (y, x) in d["piksel"]:
-                kulit[y, x] = 1
-    return warna, kulit
+        # region kecil (< 0.5% foto) atau yang sebagian besar ada di pita tepi
+        # (latar yang warnanya lain, mis. pinggir meja) bukan blister
+        di_pita = sum(pita[i] for i in d["piksel"])
+        if d["luas"] >= 0.005 * na and di_pita <= 0.3 * d["luas"]:
+            pilih.append(d)
+    roi_bersih = mask_dari_region(pilih, wa, ha)
+    if pilih:
+        x0 = min(d["x0"] for d in pilih)
+        y0 = min(d["y0"] for d in pilih)
+        x1 = max(d["x1"] for d in pilih) + 1
+        y1 = max(d["y1"] for d in pilih) + 1
+    else:
+        x0, y0, x1, y1 = 0, 0, wa, ha
+    langkah.append(langkah_baru(
+        "Area blister (ROI)", "09 Representation (morfologi) + 02 Konektivitas",
+        "Threshold ganda (kroma ATAU RGB), opening, closing, hole filling, pelabelan N4",
+        "ROI = (jarak kroma > " + bulat(acuan[3]) + ") OR (jarak RGB > " + str(t_r) + ");  opening 5x5;  "
+        "closing 9x9;  isi lubang",
+        "Piksel yang tidak mirip latar dijadikan 1. Opening 5x5 (erosi lalu dilasi) membuang bintik, "
+        "closing 9x9 (dilasi lalu erosi) menyatukan bagian foil yang terputus, lalu lubang di dalamnya "
+        "(obat, kantong) diisi (hole filling, Gonzalez). Pelabelan N4 menemukan " + str(len(daftar)) +
+        " region; yang dipakai " + str(len(pilih)) + " region besar yang tidak menempel di tepi foto. "
+        "Tangan / jari berwarna hangat seperti latar sehingga ikut terbuang.",
+        g_mask(wa, ha, roi_bersih)))
+
+    # ---------------------------------------------------------------- A5
+    m = max(2, (x1 - x0 + y1 - y0) // 30)
+    kx0 = max((x0 - m) * fa, 0)
+    ky0 = max((y0 - m) * fa, 0)
+    kx1 = min((x1 + m) * fa, lebar0)
+    ky1 = min((y1 + m) * fa, tinggi0)
+    return acuan, fa, (kx0, ky0, kx1, ky1)
 
 
-def cari_blister(img, saturasi, intensitas, kulit):
-    # Foil blister = TERANG (I besar) + TIDAK BERWARNA (S kecil) + KASAR (banyak tepi).
-    abu = ke_abu(img)
-    tinggi = abu.shape[0]
-    lebar = abu.shape[1]
+# ======================= TAHAP B : MENGHITUNG OBAT ===========================
+def tahap_b_awal(lebar0, tinggi0, data, acuan, fa, kotak, langkah):
+    c = Konteks()
+    kx0, ky0, kx1, ky1 = kotak
+    fb = faktor_sampling(lebar0, tinggi0, UKURAN_B)
+    w, h, R, G, B, f = sampling_kotak(lebar0, tinggi0, data, kx0, ky0, kx1, ky1, UKURAN_B, fb)
+    c.w, c.h, c.f = w, h, f
+    c.kotak = kotak
+    langkah.append(langkah_baru(
+        "Potong blister dari foto asli", "01 Introduction to DIP I",
+        "Cropping + sampling ulang",
+        "kotak ROI x " + str(fa) + " -> foto asli [" + str(kx0) + ".." + str(kx1) + "] x [" + str(ky0) +
+        ".." + str(ky1) + "], blok " + str(f) + " x " + str(f),
+        "Kotak pembatas ROI dikali faktor sampling tahap A (" + str(fa) + ") supaya menjadi koordinat foto "
+        "ASLI, ditambah sedikit margin, lalu hanya bagian itu yang diambil dan di-sampling dengan blok " +
+        str(f) + " x " + str(f) + " -> " + str(w) + " x " + str(h) + " piksel. Semua langkah berikutnya "
+        "bekerja pada potongan ini (lebih detail daripada foto kecil, dan lebih cepat daripada foto utuh).",
+        g_rgb(w, h, R, G, B)))
 
-    skor = konvolusi(intensitas * (1 - saturasi), kernel_mean(JENDELA_TEKSTUR))
-    skor_8bit = ke_8bit(skor, skor.max())
-    hist_skor = histogram(skor_8bit)
-    batas_skor = otsu(hist_skor)
+    # ---------------------------------------------------------------- B1
+    Y = ke_abu(R, G, B)
+    Y8 = ke_int(Y)
+    salt, med = cek_salt_pepper(Y8, w, h)
+    noise = estimasi_noise(Y, w, h)
+    pakai_median = salt > BATAS_SALT
+    pakai_lowpass = noise > BATAS_NOISE
+    if pakai_median:
+        R = median3(R, w, h)
+        G = median3(G, w, h)
+        B = median3(B, w, h)
+    if pakai_lowpass:
+        R = ke_int(konvolusi3(R, w, h, LOWPASS_32, 32))
+        G = ke_int(konvolusi3(G, w, h, LOWPASS_32, 32))
+        B = ke_int(konvolusi3(B, w, h, LOWPASS_32, 32))
+    teks = []
+    if pakai_median:
+        teks.append("median 3x3 dijalankan pada R, G, B")
+    if pakai_lowpass:
+        teks.append("lowpass (1/32)[1 3 1; 3 16 3; 1 3 1] dijalankan pada R, G, B")
+    langkah.append(langkah_baru(
+        "Cek noise -> restorasi", "06 Image Restoration (+ 03 Spatial Filtering)",
+        "Deteksi salt & pepper + estimasi noise di patch datar",
+        "g = f + eta;  impulse = |f - median3x3| > 60 di piksel ekstrem;  "
+        "noise = rata |f - rata N4| di 25% blok 8x8 terdatar",
+        "Sebelum dianalisis, citra diperiksa: piksel salt & pepper = " + bulat(salt * 100, 3) +
+        "% (batas " + bulat(BATAS_SALT * 100, 0) + "%), noise di patch datar = " + bulat(noise, 2) +
+        " (batas " + bulat(BATAS_NOISE, 0) + "). " +
+        ("Dipakai: " + "; ".join(teks) + "." if teks else
+         "Keduanya di bawah batas, jadi filter TIDAK dijalankan agar tepi obat tetap tajam."),
+        g_abu(w, h, Y8), pakai_median or pakai_lowpass))
 
-    tepi = sobel(abu)
-    tekstur = konvolusi(tepi, kernel_mean(JENDELA_TEKSTUR))
-    tekstur_8bit = tekstur * 255 / (tekstur.max() + 0.001)
-    hist_tekstur = histogram(tekstur_8bit)
-    batas_tekstur = otsu(hist_tekstur)
-
-    foil = threshold(skor_8bit, batas_skor) * threshold(tekstur_8bit, batas_tekstur)
-    foil = foil * (1 - kulit)              # kulit / meja bukan foil
-    p = PITA_TEPI_FOTO                     # efek batas filter di tepi foto
-    foil[:p, :] = 0
-    foil[tinggi - p:, :] = 0
-    foil[:, :p] = 0
-    foil[:, lebar - p:] = 0
-
-    roi = closing(foil, CLOSING_ROI)
-    roi = isi_lubang(roi)
-    roi = roi * (1 - kulit)                # jari yang menutupi blister dibuang lagi
-    roi = opening(roi, OPENING_ROI)
-    _, daftar_roi = label_region(roi)
-    roi = region_terbesar(roi)
-    ketemu = roi.sum() >= 0.01 * abu.size
-    if not ketemu:                         # blister tidak ketemu -> seluruh foto
-        roi = np.ones(abu.shape)
-    return {"skor": skor_8bit, "hist_skor": hist_skor, "batas_skor": batas_skor,
-            "tekstur": tekstur_8bit, "hist_tekstur": hist_tekstur, "batas_tekstur": batas_tekstur,
-            "foil": foil, "roi": roi, "jumlah_region": len(daftar_roi), "ketemu": ketemu}
-
-
-def potong_blister(asli, kecil, roi):
-    # kotak pembatas ROI (gambar kecil) -> potong dari foto ASLI resolusi penuh,
-    # lalu sampling lagi sampai sisi terpanjang <= UKURAN_OBAT.
-    f = asli.shape[0] / kecil.shape[0]
-    y0 = kecil.shape[0]
-    y1 = 0
-    x0 = kecil.shape[1]
-    x1 = 0
-    for y in range(roi.shape[0]):
-        baris = roi[y]
-        if baris.max() > 0.5:
-            if y < y0:
-                y0 = y
-            y1 = y
-            for x in range(roi.shape[1]):
-                if baris[x] > 0.5:
-                    if x < x0:
-                        x0 = x
-                    if x > x1:
-                        x1 = x
-    m = MARGIN_POTONG
-    ay0 = max(int((y0 - m) * f), 0)
-    ay1 = min(int((y1 + m + 1) * f), asli.shape[0])
-    ax0 = max(int((x0 - m) * f), 0)
-    ax1 = min(int((x1 + m + 1) * f), asli.shape[1])
-
-    langkah = faktor_sampling(ay1 - ay0, ax1 - ax0, UKURAN_OBAT)
-    potong = asli[ay0:ay1:langkah, ax0:ax1:langkah].copy()
-    potong = potong[:potong.shape[0] // 2 * 2, :potong.shape[1] // 2 * 2]
-
-    # ROI ikut dipindah ke koordinat potongan (piksel terdekat)
-    roi_potong = np.zeros((potong.shape[0], potong.shape[1]))
-    for y in range(potong.shape[0]):
-        ky = int((ay0 + y * langkah) / f)
-        if ky > kecil.shape[0] - 1:
-            ky = kecil.shape[0] - 1
-        for x in range(potong.shape[1]):
-            kx = int((ax0 + x * langkah) / f)
-            if kx > kecil.shape[1] - 1:
-                kx = kecil.shape[1] - 1
-            roi_potong[y, x] = roi[ky, kx]
-    return potong, roi_potong, langkah
-
-
-def bungkus_oktagon(mask):
-    # Blister persegi (boleh miring) tidak punya coakan. Mask dibungkus
-    # oktagon: batas min/maks dari x, y, x+y, x-y (arah lurus & diagonal),
-    # sehingga coakan karena bayangan / obat di tepi ikut tertutup.
-    yy, xx = koordinat(mask.shape[0], mask.shape[1])
-    ada = mask > 0.5
-    hasil = np.ones(mask.shape)
-    for nilai in (xx, yy, xx + yy, xx - yy):
-        v = nilai[ada]
-        hasil = hasil * (nilai >= v.min()) * (nilai <= v.max())
-    return hasil
+    # ---------------------------------------------------------------- B2
+    Y, c1, c2 = kroma_yiq(R, G, B)
+    Y8 = ke_int(Y)
+    _, S, _ = rgb_ke_hsi(R, G, B)
+    c.R, c.G, c.B, c.Y, c.c1, c.c2, c.S = R, G, B, Y, c1, c2, S
+    c.b1, c.b2 = acuan[0], acuan[1]
+    roi = mask_roi(w, h, c1, c2, R, G, B, acuan, fa / float(f))
+    _, daftar = label_region(roi, w, h, 4)
+    roi = mask_dari_region([d for d in daftar if d["luas"] >= 0.02 * w * h], w, h)
+    luas_roi = sum(roi)
+    if luas_roi == 0:
+        roi = [1] * (w * h)
+        luas_roi = w * h
+    c.roi = roi
+    c.luas_roi = luas_roi
+    c.min_luas = max(MIN_LUAS, int(MIN_LUAS_ROI * luas_roi))
+    hist_y = histogram(Y8, roi)
+    mu, sd = rata_dan_std(hist_y)
+    langkah.append(langkah_baru(
+        "Grayscale (Y) & histogram blister", "05 Color Image Processing + 02 Image Enhancement",
+        "Graylevel = luminance Y dari YIQ; histogram di dalam ROI",
+        "Y = 0.299 R + 0.587 G + 0.114 B;   p(r_k) = n_k / n;   mu = sum k p(k)",
+        "Potongan diubah ke graylevel dengan rumus luminance Y (slide 05: Y = terang-gelap). ROI "
+        "dihitung ulang di potongan dengan threshold yang sama dari tahap A. Histogram graylevel di dalam "
+        "blister: rata-rata " + bulat(mu, 0) + ", simpangan baku " + bulat(sd, 1) + ". Kecerahan setiap "
+        "foto berbeda (terang/gelap), karena itu langkah berikutnya tidak memakai threshold tetap, "
+        "melainkan membandingkan obat dengan foil DI FOTO YANG SAMA.",
+        g_hist(hist_y, int(mu + 0.5), "graylevel Y di dalam blister", "rata-rata")))
+    return c
 
 
-# ======================== PENILAIAN CALON OBAT ===============================
-def potong_region(d, r, tinggi, lebar):
-    # kotak di sekitar region (dengan margin r) + mask region di dalam kotak
-    y0 = max(d["y0"] - r, 0)
-    y1 = min(d["y1"] + r + 1, tinggi)
-    x0 = max(d["x0"] - r, 0)
-    x1 = min(d["x1"] + r + 1, lebar)
-    m = np.zeros((y1 - y0, x1 - x0))
-    for (y, x) in d["piksel"]:
-        m[y - y0, x - x0] = 1
-    return y0, y1, x0, x1, m
+def tahap_b_peta(c, langkah):
+    w, h, n = c.w, c.h, c.w * c.h
+    roi = c.roi
+    # ---------------------------------------------------------------- B3
+    sd = std_lokal(c.Y, w, h, JENDELA_STD)
+    sd8 = skala_8bit(sd, 0, SKALA_STD)
+    t_sd = otsu(histogram(sd8, roi))
+    c.sd = sd
+    kasar = [i for i in range(n) if roi[i] and sd8[i] > t_sd]
+    Yf = nilai_tengah([c.Y[i] for i in kasar]) if kasar else 128.0
+    c1f = nilai_tengah([c.c1[i] for i in kasar]) if kasar else 0.0
+    c2f = nilai_tengah([c.c2[i] for i in kasar]) if kasar else 0.0
+    c.Yf, c.c1f, c.c2f = Yf, c1f, c2f
+    langkah.append(langkah_baru(
+        "Tekstur: simpangan baku lokal", "03 Spatial Filtering + 08 Image Segmentation",
+        "Dua lowpass rata-rata 5x5 -> std lokal, threshold Otsu",
+        "std = sqrt( mean5x5(f^2) - mean5x5(f)^2 );  halus bila std <= T = " + bulat(t_sd * SKALA_STD / 255.0),
+        "Foil aluminium bertekstur (pola belah ketupat, tepi kantong), permukaan obat HALUS. Simpangan "
+        "baku di jendela 5x5 dihitung dari dua filter rata-rata (lowpass 1/25, slide 03). Threshold Otsu "
+        "membagi piksel blister menjadi halus dan kasar (T = " + bulat(t_sd * SKALA_STD / 255.0) + "). "
+        "Piksel kasar dipakai sebagai CONTOH FOIL: kecerahan foil (median) Yf = " + bulat(Yf, 0) +
+        ", kroma foil (" + bulat(c1f) + ", " + bulat(c2f) + "). Obat nanti dibandingkan dengan foil ini.",
+        g_panas(w, h, sd8, "std lokal (0..40)")))
+
+    # ---------------------------------------------------------------- B4
+    batas = BATAS_FOIL * Yf
+    g = [(y if y > batas else batas) if m else 255.0 for y, m in zip(c.Y, roi)]
+    k = ganjil(0.25 * akar(c.luas_roi))
+    k = max(15, min(k, ganjil(min(w, h) / 3.0)))
+    th, _ = top_hat(g, w, h, k)
+    th8 = skala_8bit([t if m else 0.0 for t, m in zip(th, roi)], 0, SKALA_TOPHAT)
+    t_th = max(otsu(histogram(th8, roi)), int(MIN_T_TOPHAT * 255 / SKALA_TOPHAT))
+    langkah.append(langkah_baru(
+        "Lebih terang dari foil: top-hat", "09 Morfologi (graylevel) + 03 filter min/maks",
+        "Opening graylevel = filter minimum lalu maksimum " + str(k) + "x" + str(k) + "; top-hat = f - opening",
+        "top-hat = f - max_kxk( min_kxk(f) );   f' = max(f, " + bulat(BATAS_FOIL, 2) + " x Yf) di dalam blister",
+        "Opening graylevel dengan structuring element " + str(k) + "x" + str(k) + " (lebih besar dari "
+        "obat) menghapus benda TERANG yang lebih kecil dari SE, sehingga hasilnya = perkiraan foil di "
+        "sekitar setiap piksel. Top-hat = citra - opening = seberapa terang piksel itu DI ATAS foil di "
+        "sekitarnya (tahan terhadap lampu yang tidak rata). Sebelumnya piksel gelap (tulisan, kantong "
+        "kosong) dinaikkan ke " + bulat(BATAS_FOIL, 2) + " x Yf supaya tidak menurunkan perkiraan foil, dan "
+        "piksel di luar blister diberi 255. Threshold Otsu = " +
+        bulat(t_th * SKALA_TOPHAT / 255.0) + " gray level.",
+        g_panas(w, h, th8, "top-hat (0..100)")))
+
+    # ---------------------------------------------------------------- B5
+    dc = [((a - c1f) ** 2 + (b - c2f) ** 2) ** 0.5 for a, b in zip(c.c1, c.c2)]
+    dc8 = skala_8bit(dc, 0, SKALA_KROMA)
+    t_dc = max(otsu(histogram(dc8, roi)), int(MIN_T_KROMA * 255 / SKALA_KROMA))
+    langkah.append(langkah_baru(
+        "Beda warna dari foil", "05 Color Image Processing",
+        "Jarak Euclid kroma (c1, c2) setiap piksel ke kroma foil",
+        "dK = sqrt( (c1 - " + bulat(c1f) + ")^2 + (c2 - " + bulat(c2f) + ")^2 );  T = " +
+        bulat(t_dc * SKALA_KROMA / 255.0),
+        "Obat kuning, krem, atau merah belum tentu lebih terang dari foil, tetapi WARNANYA beda. Jarak "
+        "Euclid (De, materi 02) di bidang kroma (c1, c2) ke kroma foil menonjolkan obat berwarna. "
+        "Threshold Otsu (minimal " + bulat(MIN_T_KROMA, 0) + ") = " + bulat(t_dc * SKALA_KROMA / 255.0) + ".",
+        g_panas(w, h, dc8, "beda kroma dari foil (0..60)")))
+
+    # ---------------------------------------------------------------- B6
+    kand = []
+    for i in range(n):
+        if not roi[i] or sd8[i] > t_sd:
+            kand.append(0)                         # di luar blister / kasar
+        elif th8[i] > t_th:
+            kand.append(1)                         # lebih terang dari foil
+        elif dc8[i] > t_dc and (c.Y[i] > GELAP_BOLEH * Yf or
+                                (c.S[i] > JENUH_GELAP and c.Y[i] > 0.25 * Yf)):
+            kand.append(1)                         # warnanya beda dari foil
+        else:
+            kand.append(0)
+    kand = opening(kand, w, h, 3)
+    kand = isi_lubang(kand, w, h)
+    langkah.append(langkah_baru(
+        "Kandidat obat", "02 Enhancement (threshold) + 09 Morfologi",
+        "Gabungan threshold (AND / OR), opening 3x3, hole filling",
+        "kandidat = ROI AND halus AND ( top-hat > T1  OR  ( dK > T2 AND Y cukup terang ) );  opening 3x3",
+        "Piksel menjadi kandidat obat bila di dalam blister, permukaannya halus, dan lebih terang dari "
+        "foil ATAU warnanya beda dari foil (piksel berwarna boleh lebih gelap bila jenuh, S > " +
+        bulat(JENUH_GELAP, 2) + " dari HSI, untuk belahan kapsul merah). Opening 3x3 membuang bintik, "
+        "lalu lubang kecil (huruf timbul di obat) diisi.",
+        g_mask(w, h, kand)))
+    return kand
 
 
-def luas_cincin_utuh(d, r):
-    # luas cincin bila region TIDAK terpotong tepi gambar
-    m = np.zeros((d["y1"] - d["y0"] + 1 + 2 * r + 2, d["x1"] - d["x0"] + 1 + 2 * r + 2))
-    for (y, x) in d["piksel"]:
-        m[y - d["y0"] + r + 1, x - d["x0"] + r + 1] = 1
-    return (dilasi(m, 2 * r + 1) - dilasi(m, 5)).sum()
+# ---------------------------- PENILAIAN REGION ------------------------------
+def fitur(c, piksel):
+    # Deskriptor sebuah region (materi 09) + pembandingnya: CINCIN di
+    # sekeliling region = dilasi besar - dilasi kecil. Obat selalu duduk di
+    # dalam kantong blister, jadi cincinnya berisi dinding kantong / foil.
+    w, h = c.w, c.h
+    d = {"piksel": piksel, "luas": len(piksel)}
+    d.update(momen(piksel, w))
+    r = LEBAR_CINCIN
+    x0, y0, bw, bh, m = kotak_lokal(piksel, r + 1, w, h)
+    besar = dilasi(m, bw, bh, 2 * r + 1)
+    kecil = dilasi(m, bw, bh, 3)
+    cincin = ke_global([q for q in range(bw * bh) if besar[q] and not kecil[q]], x0, y0, bw, w)
+    cin_roi = [i for i in cincin if c.roi[i]]
+    d["di_roi"] = len(cin_roi) / float(len(cincin) + 1)
+    acuan = cin_roi if len(cin_roi) > 10 else cincin
+    d["Yin"] = nilai_tengah([c.Y[i] for i in piksel])
+    a1 = nilai_tengah([c.c1[i] for i in piksel])
+    a2 = nilai_tengah([c.c2[i] for i in piksel])
+    k1 = nilai_tengah([c.c1[i] for i in acuan])
+    k2 = nilai_tengah([c.c2[i] for i in acuan])
+    d["dY"] = d["Yin"] - nilai_tengah([c.Y[i] for i in acuan])      # beda terang dg cincin
+    d["dK"] = akar((a1 - k1) ** 2 + (a2 - k2) ** 2)                 # beda kroma dg cincin
+    d["dKlatar"] = akar((a1 - c.b1) ** 2 + (a2 - c.b2) ** 2)         # beda kroma dg latar
+    d["cinfoil"] = akar((k1 - c.c1f) ** 2 + (k2 - c.c2f) ** 2)       # cincin mirip foil?
+    d["S"] = nilai_tengah([c.S[i] for i in piksel])
+    d["warna"] = [nilai_tengah([K[i] for i in piksel]) for K in (c.R, c.G, c.B)]
+    xs = [i % w for i in piksel]
+    ys = [i // w for i in piksel]
+    d["x0"], d["x1"], d["y0"], d["y1"] = min(xs), max(xs), min(ys), max(ys)
+    return d
 
 
-def nilai_calon(img, roi, d, luas_roi, jarak_meja, warna_meja):
-    # Menilai satu calon obat TANPA melihat warna obat tertentu.
-    # Hasil: "ok" atau alasan ditolak.
-    if d["luas"] < MIN_INTI:
+def nilai(c, d):
+    # aturan keputusan (urut). Hasil "ok" atau alasan penolakan.
+    if d["luas"] < c.min_luas:
         return "kecil"
-    if d["luas"] > MAKS_LUAS_ROI * luas_roi:
+    if d["luas"] > MAKS_LUAS_ROI * c.luas_roi:
         return "besar"
-    cy, cx, isi, lonjong = momen_region(d["piksel"])
-    if isi < MIN_ISI or lonjong > MAKS_LONJONG:
+    if d["isi"] < MIN_ISI or d["lonjong"] > MAKS_LONJONG:
         return "bentuk"
-
-    # cincin di sekeliling calon (dilasi besar - dilasi kecil)
-    r = LEBAR_CINCIN + 2
-    y0, y1, x0, x1, m = potong_region(d, r, img.shape[0], img.shape[1])
-    cincin = (dilasi(m, 2 * r + 1) - dilasi(m, 5)) * roi[y0:y1, x0:x1]
-    # 1) harus dikelilingi blister
-    if cincin.sum() < MIN_DIKELILINGI * luas_cincin_utuh(d, r):
-        return "tepi"
-    # 2) warnanya beda dengan cincin sekitarnya (obat menonjol dari kantongnya)
-    potong = img[y0:y1, x0:x1]
-    dalam = median_warna(potong, m)
-    luar = median_warna(potong, cincin)
-    if jarak_dua_warna(dalam, luar) < BEDA_SEKITAR:
-        return "kontras"
-    # 2b) lubang / bayangan: lebih GELAP dari sekitarnya dan TIDAK berwarna
-    #     (foil sobek, celah gelap, bayangan). Obat putih selalu lebih terang,
-    #     obat berwarna punya saturasi.
-    h_dalam, s_dalam, i_dalam = hsi_satu_warna(dalam)
-    h_luar, s_luar, i_luar = hsi_satu_warna(luar)
-    if i_dalam < i_luar and jarak_ke_abu(dalam) < BATAS_ABU:
-        return "lubang"
-    # 2c) kantong kosong transparan: meja terlihat tembus plastik, jadi
-    #     kecerahannya berubah tetapi HUE-nya tetap hue meja
-    if warna_meja is not None:
-        h_meja, s_meja, i_meja = hsi_satu_warna(warna_meja)
-        if s_meja >= MIN_S_HUE and s_dalam >= MIN_S_HUE and s_dalam <= s_meja and beda_hue(h_dalam, h_meja) < BEDA_HUE_MEJA:
-            return "tembus"
-    # 3) tepi tegas: rata-rata Sobel di pita garis batas
-    pita = dilasi(m, 7) - erosi(m, 5)
-    tepi = sobel(ke_abu(potong))
-    if (tepi * pita).sum() / (pita.sum() + 1) < MIN_TAJAM:
-        return "pudar"
-    # 4) kantong kosong transparan: di sekeliling kilau plastiknya terlihat meja
-    if jarak_meja is not None:
-        mirip_meja = (jarak_meja[y0:y1, x0:x1] < BEDA_MEJA) * cincin
-        if mirip_meja.sum() >= MAKS_CINCIN_MEJA * cincin.sum():
-            return "pantulan"
+    if d["di_roi"] < MIN_DI_ROI or d["cinfoil"] > MAKS_CINCIN_FOIL:
+        return "luar"                     # tidak berada di dalam kantong blister
+    terang = d["dY"] >= BEDA_TERANG and d["Yin"] >= TERANG_FOIL * c.Yf
+    warna = d["dK"] >= BEDA_KROMA and (d["dY"] >= -10 or d["S"] >= JENUH or d["dK"] >= KROMA_KUAT)
+    if not (terang or warna):
+        return "kontras"                  # tidak menonjol dari kantongnya
+    if d["dKlatar"] < MIRIP_LATAR and d["dY"] < BEDA_TERANG:
+        return "latar"                    # kantong kosong: yang terlihat meja
     return "ok"
 
 
-def geser_region(b, y0, x0):
-    # koordinat region dari kotak kecil -> koordinat gambar
-    piksel_baru = []
-    for (y, x) in b["piksel"]:
-        piksel_baru.append((y + y0, x + x0))
-    b["piksel"] = piksel_baru
-    b["y0"] += y0
-    b["y1"] += y0
-    b["x0"] += x0
-    b["x1"] += x0
-    return b
-
-
-def pecah_dan_nilai(img, roi, d, luas_roi, tingkat, jarak_meja, warna_meja, hitung):
-    # Nilai region d. Bila gagal karena BENTUK / terlalu BESAR (obat menempel
-    # ke foil datar), pecah dengan opening yang lebih besar lalu nilai lagi.
-    alasan = nilai_calon(img, roi, d, luas_roi, jarak_meja, warna_meja)
-    if alasan in hitung:
-        hitung[alasan] += 1
-    else:
-        hitung[alasan] = 1
-    if alasan == "ok":
-        return [d]
-    if (alasan != "bentuk" and alasan != "besar") or tingkat >= len(PISAH_BERTINGKAT):
-        return []
-    y0 = d["y0"]
-    x0 = d["x0"]
-    m = np.zeros((d["y1"] - y0 + 1, d["x1"] - x0 + 1))
-    for (y, x) in d["piksel"]:
-        m[y - y0, x - x0] = 1
-    _, bagian = label_region(opening(m, PISAH_BERTINGKAT[tingkat]))
-    lolos = []
-    for b in bagian:
-        lolos = lolos + pecah_dan_nilai(img, roi, geser_region(b, y0, x0), luas_roi,
-                                        tingkat + 1, jarak_meja, warna_meja, hitung)
-    return lolos
-
-
-def tumbuhkan_obat(img, label, d, jarak_foil, jarak_meja, roi, terpakai):
-    # REGION GROWING dari inti obat (seed). Piksel tetangga boleh ikut bila
-    # warnanya mirip obat (jarak < BATAS_TUMBUH) dan lebih mirip obat
-    # daripada foil / meja. Hasilnya mengikuti bentuk asli obat.
-    tinggi = img.shape[0]
-    lebar = img.shape[1]
-    r = LANGKAH_TUMBUH
-    y0 = max(d["y0"] - r, 0)
-    y1 = min(d["y1"] + r + 1, tinggi)
-    x0 = max(d["x0"] - r, 0)
-    x1 = min(d["x1"] + r + 1, lebar)
-
-    warna = warna_rata(img, d["piksel"])
-    jarak_obat = jarak_warna(img[y0:y1, x0:x1], warna)
-    boleh = (jarak_obat < jarak_foil[y0:y1, x0:x1]) * (jarak_obat < BATAS_TUMBUH)
-    boleh = boleh * roi[y0:y1, x0:x1] * (1 - terpakai[y0:y1, x0:x1])
-    if jarak_meja is not None:
-        boleh = boleh * (jarak_obat < jarak_meja[y0:y1, x0:x1])
-
-    inti = (label[y0:y1, x0:x1] == d["nomor"]) * 1.0
-    tumbuh = region_growing(inti, boleh, r)
-    tumbuh = isi_lubang(opening(closing(tumbuh, 5), 3))
-    tumbuh = region_terbesar(tumbuh)
-    bocor = False
-    if tumbuh.sum() > MAKS_TUMBUH * d["luas"] or tumbuh.sum() == 0:
-        bocor = True                         # bocor ke foil -> pakai inti saja
-    else:
-        _, daftar = label_region(tumbuh)
-        _, _, isi, lonjong = momen_region(daftar[0]["piksel"])
-        if isi < MIN_ISI:
-            bocor = True                     # bentuk rusak -> inti saja
-    if bocor:
-        tumbuh = inti
-
-    hasil = np.zeros((tinggi, lebar))
-    hasil[y0:y1, x0:x1] = tumbuh
-    return hasil, bocor
-
-
-def pisahkan_sambungan(d, tinggi, lebar):
-    # Opening 11x11 memutus "jembatan" tipis antara obat dan pantulan.
-    # Bila region pecah jadi >= 2 bagian, tiap bagian dinilai sendiri.
-    y0, y1, x0, x1, m = potong_region(d, 1, tinggi, lebar)
-    _, bagian = label_region(opening(m, OPENING_PISAH))
+def belah(c, d):
+    # REGION SPLITTING (materi 08). Region yang ditolak bisa jadi gabungan
+    # obat + foil + pantulan. Region dibelah dua dengan Otsu di dalam region
+    # memakai fitur yang PALING memisahkan (eta Otsu terbesar):
+    #   Y (kecerahan), kroma, atau tekstur (std lokal).
+    piksel = d["piksel"]
+    ys = [c.Y[i] for i in piksel]
+    m1 = nilai_tengah([c.c1[i] for i in piksel])
+    m2 = nilai_tengah([c.c2[i] for i in piksel])
+    kd = [akar((c.c1[i] - m1) ** 2 + (c.c2[i] - m2) ** 2) for i in piksel]
+    ss = [c.sd[i] for i in piksel]
+    pilihan = []
+    for nama, nilai_ in (("kecerahan", ys), ("kroma", kd), ("tekstur", ss)):
+        v8 = skala_8bit(nilai_, min(nilai_), max(nilai_) + 1)
+        T, eta = otsu_eta(v8)
+        pilihan.append((eta, nama, T, v8))
+    pilihan.sort(key=lambda t: -t[0])
+    eta, nama, T, v8 = pilihan[0]
+    d["fitur_belah"] = nama
     hasil = []
-    for b in bagian:
-        if b["luas"] >= MIN_INTI:
-            hasil.append(geser_region(b, y0, x0))
-    if len(hasil) >= 2:
-        return hasil
-    return [d]
+    for bagian in ([p for p, v in zip(piksel, v8) if v > T], [p for p, v in zip(piksel, v8) if v <= T]):
+        if len(bagian) < c.min_luas:
+            continue
+        x0, y0, bw, bh, m = kotak_lokal(bagian, 2, c.w, c.h)
+        m = opening(m, bw, bh, 3)                        # putus jembatan tipis
+        m = isi_lubang(m, bw, bh, c.min_luas)            # hanya lubang kecil diisi
+        _, daftar = label_region(m, bw, bh, 8)
+        for r in daftar:
+            if r["luas"] >= c.min_luas:
+                hasil.append(ke_global(r["piksel"], x0, y0, bw, c.w))
+    return hasil
 
 
-def sudut_sumbu(piksel, cy, cx):
-    # arah sumbu panjang region (radian) dari momen pusat orde 2
-    m20 = 0
-    m02 = 0
-    m11 = 0
-    for (y, x) in piksel:
-        m20 += (y - cy) * (y - cy)
-        m02 += (x - cx) * (x - cx)
-        m11 += (y - cy) * (x - cx)
-    return 0.5 * math.atan2(2 * m11, m02 - m20)
+def evaluasi(c, piksel, tingkat, terima, tolak, catatan):
+    d = fitur(c, piksel)
+    d["alasan"] = nilai(c, d)
+    d["tingkat"] = tingkat
+    if d["alasan"] == "ok":
+        terima.append(d)
+        return
+    if d["alasan"] in ("bentuk", "kontras", "latar", "besar") and tingkat < MAKS_TINGKAT \
+            and d["luas"] >= 3 * c.min_luas:
+        bagian = belah(c, d)
+        if bagian and not (len(bagian) == 1 and len(bagian[0]) == d["luas"]):
+            catatan[d["fitur_belah"]] = catatan.get(d["fitur_belah"], 0) + 1
+            for b in bagian:
+                evaluasi(c, b, tingkat + 1, terima, tolak, catatan)
+            return
+    tolak.append(d)
 
 
-def warna_belahan(img, d):
-    # Region dibelah dua tegak lurus sumbu panjangnya. Hasil: warna rata-rata
-    # kedua belahan (None bila salah satu belahan kosong).
-    cy = d["cy"]
-    cx = d["cx"]
-    sudut = sudut_sumbu(d["piksel"], cy, cx)
-    ux = math.cos(sudut)
-    uy = math.sin(sudut)
-    kiri = []
-    kanan = []
-    for (y, x) in d["piksel"]:
-        if (x - cx) * ux + (y - cy) * uy < 0:
-            kiri.append((y, x))
-        else:
-            kanan.append((y, x))
-    if len(kiri) == 0 or len(kanan) == 0:
+def berwarna(d):
+    # belahan kapsul berwarna (merah, dll.)
+    return d["dK"] >= WARNA_KAPSUL or d["S"] >= JENUH
+
+
+def coba_gabung(c, a, b):
+    # Apakah a dan b dua belahan SATU kapsul? Syarat: satu berwarna, satu tidak;
+    # luasnya sebanding; jaraknya dekat; dan setelah closing gabungannya satu
+    # region berbentuk kapsul (keterisian >= 0.8, kelonjongan <= 4).
+    rasio = a["luas"] / float(b["luas"])
+    if rasio < 0.4 or rasio > 2.5 or berwarna(a) == berwarna(b):
         return None
-    return warna_rata(img, kiri), warna_rata(img, kanan)
-
-
-def cek_dua_warna(img, d):
-    # Kapsul = dua warna: warna rata-rata kedua belahan dibandingkan dengan
-    # jarak Euclid (materi 05).
-    belahan = warna_belahan(img, d)
-    if belahan is None:
-        return False
-    return jarak_dua_warna(belahan[0], belahan[1]) > BEDA_DUA_WARNA
-
-
-def coba_gabung(a, b, img, tinggi, lebar):
-    # Apakah region a dan b adalah DUA BELAHAN satu kapsul?
-    #   1) bersentuhan / celah <= 0.6 x lebar belahan (dilasi a mengenai b)
-    #   2) warnanya beda jelas (> BEDA_DUA_WARNA): belahan kapsul beda warna,
-    #      sedangkan 2 obat sewarna yang menempel tetap dihitung terpisah
-    #   3) gabungannya berbentuk kapsul: lonjong 1.6..4 dan isi elips >= 0.8
-    # Hasil: region gabungan, atau None bila bukan satu kapsul.
-    if jarak_dua_warna(warna_rata(img, a["piksel"]), warna_rata(img, b["piksel"])) <= BEDA_DUA_WARNA:
+    celah = int(1.2 * min(a["b"], b["b"])) + 3
+    if a["x0"] > b["x1"] + celah or b["x0"] > a["x1"] + celah or \
+            a["y0"] > b["y1"] + celah or b["y0"] > a["y1"] + celah:
         return None
-    # celah maksimum ikut ukuran obat: 0.6 x lebar belahan yang lebih besar.
-    # lebar = sumbu pendek elips setara = 2 * sqrt(A / (pi * lonjong))
-    besar = a
-    if b["luas"] > a["luas"]:
-        besar = b
-    _, _, _, lonjong_besar = momen_region(besar["piksel"])
-    lebar_belahan = 2 * math.sqrt(besar["luas"] / (math.pi * lonjong_besar))
-    celah = int(KALI_CELAH_KAPSUL * lebar_belahan)
-    if celah < JARAK_KAPSUL:
-        celah = JARAK_KAPSUL
-    r = celah + 1
-    y0 = max(min(a["y0"], b["y0"]) - r, 0)
-    y1 = min(max(a["y1"], b["y1"]) + r + 1, tinggi)
-    x0 = max(min(a["x0"], b["x0"]) - r, 0)
-    x1 = min(max(a["x1"], b["x1"]) + r + 1, lebar)
-    ma = np.zeros((y1 - y0, x1 - x0))
-    mb = np.zeros((y1 - y0, x1 - x0))
-    for (y, x) in a["piksel"]:
-        ma[y - y0, x - x0] = 1
-    for (y, x) in b["piksel"]:
-        mb[y - y0, x - x0] = 1
-    if (dilasi(ma, 2 * celah + 1) * mb).sum() == 0:
-        return None                              # tidak bersentuhan
-    # celah di antara kedua belahan ditutup dengan closing, lalu isi lubang
-    gabung = isi_lubang(closing(ma + mb - ma * mb, 2 * celah + 1))
-    _, daftar = label_region(gabung)
+    w = c.w
+    x0, y0, bw, bh, m = kotak_lokal(a["piksel"] + b["piksel"], celah + 2, w, c.h)
+    ma = [0] * (bw * bh)
+    for p in a["piksel"]:
+        ma[(p // w - y0) * bw + (p % w - x0)] = 1
+    da = dilasi(ma, bw, bh, 2 * celah + 1)
+    if not any(da[(p // w - y0) * bw + (p % w - x0)] for p in b["piksel"]):
+        return None
+    mm = isi_lubang(closing(m, bw, bh, 2 * celah + 1), bw, bh)
+    _, daftar = label_region(mm, bw, bh, 8)
     if len(daftar) != 1:
         return None
-    c = geser_region(daftar[0], y0, x0)
-    c["kapsul"] = True                          # tanda: hasil gabungan 2 belahan
-    _, _, isi, lonjong = momen_region(c["piksel"])
-    if isi < 0.8 or lonjong < 1.6 or lonjong > MAKS_LONJONG:
+    px = ke_global(daftar[0]["piksel"], x0, y0, bw, w)
+    mo = momen(px, w)
+    if mo["isi"] < 0.8 or mo["lonjong"] > 4.0:
         return None
-    return c
+    d = fitur(c, px)
+    d["alasan"] = "ok"
+    d["kapsul"] = True
+    return d
 
 
-def gabung_kapsul(daftar, img, tinggi, lebar):
-    # Gabungkan pasangan belahan kapsul berulang kali sampai tidak ada lagi.
+def gabung_kapsul(c, terima, tolak):
+    # 1) dua region DITERIMA yang ternyata dua belahan kapsul -> satu
+    # 2) belahan berwarna yang diterima sendirian dilengkapi dengan belahan
+    #    putihnya yang tadi DITOLAK (tidak cukup terang dari foil)
     n_gabung = 0
-    ada_gabung = True
-    while ada_gabung:
-        ada_gabung = False
-        for i in range(len(daftar)):
-            for j in range(i + 1, len(daftar)):
-                c = coba_gabung(daftar[i], daftar[j], img, tinggi, lebar)
-                if c is not None:
-                    baru = []
-                    for k in range(len(daftar)):
-                        if k != i and k != j:
-                            baru.append(daftar[k])
-                    baru.append(c)
-                    daftar = baru
+    ada = True
+    while ada:
+        ada = False
+        for i in range(len(terima)):
+            for j in range(i + 1, len(terima)):
+                g = coba_gabung(c, terima[i], terima[j])
+                if g is not None:
+                    terima = [terima[k] for k in range(len(terima)) if k != i and k != j] + [g]
                     n_gabung += 1
-                    ada_gabung = True
+                    ada = True
                     break
-            if ada_gabung:
+            if ada:
                 break
-    return daftar, n_gabung
+    n_lengkap = 0
+    for i in range(len(terima)):
+        a = terima[i]
+        if a.get("kapsul") or not berwarna(a):
+            continue
+        for j in range(len(tolak)):
+            b = tolak[j]
+            if b["alasan"] not in ("kontras", "latar", "kecil") or berwarna(b) or b["dY"] < 0:
+                continue
+            g = coba_gabung(c, a, b)
+            if g is not None:
+                terima[i] = g
+                tolak.pop(j)
+                n_lengkap += 1
+                break
+    return terima, n_gabung, n_lengkap
 
 
-def lengkapi_kapsul(d, img, mirip_obat, sudah, tinggi, lebar, pakai_warna):
-    # Kapsul 2 warna sering hanya tertangkap SEBAGIAN (satu belahan / satu
-    # pita sempit), karena belahan kedua warnanya dekat foil atau meja.
-    # Region digrowing lagi (materi 08) ke piksel "mirip obat" (halus ATAU
-    # warnanya jauh dari foil & meja). Bila pakai_warna, piksel juga harus
-    # dekat salah satu MODEL WARNA kapsul (warna belahan region + warna
-    # belahan kedua yang diambil dari cincin di luar region).
-    # Hasil hanya DIPAKAI bila menjadi kapsul: dua belahan beda warna,
-    # lonjong 1.6..4, isi elips >= 0.8, dan sumbunya searah region awal.
-    cy, cx, isi, lonjong = momen_region(d["piksel"])
-    if lonjong < MIN_LONJONG_BELAHAN:
-        return None                                 # bulat -> tablet, bukan belahan kapsul
-    sumbu = math.sqrt(d["luas"] * lonjong / math.pi)     # setengah sumbu panjang
-    r = int(2 * sumbu) + 2
-    y0 = max(d["y0"] - r, 0)
-    y1 = min(d["y1"] + r + 1, tinggi)
-    x0 = max(d["x0"] - r, 0)
-    x1 = min(d["x1"] + r + 1, lebar)
-    asal = np.zeros((y1 - y0, x1 - x0))
-    for (y, x) in d["piksel"]:
-        asal[y - y0, x - x0] = 1
-    boleh = mirip_obat[y0:y1, x0:x1] * (1 - sudah[y0:y1, x0:x1])
-
-    if pakai_warna:
-        kotak = img[y0:y1, x0:x1]
-        d["cy"] = cy
-        d["cx"] = cx
-        model = [warna_rata(img, d["piksel"])]
-        belahan = warna_belahan(img, d)
-        if belahan is not None:
-            model.append(belahan[0])
-            model.append(belahan[1])
-        jarak_model = jarak_warna(kotak, model[0])
-        for w in model:
-            jarak_model = np.minimum(jarak_model, jarak_warna(kotak, w))
-        # cincin di luar region: piksel yang warnanya beda dari region; 20%
-        # yang PALING beda (persentil 80) = warna belahan kedua
-        cincin = (dilasi(asal, 9) - asal) * boleh
-        lain = cincin * (jarak_model >= BATAS_TUMBUH)
-        if lain.sum() >= 10:
-            jarak_8bit = potong_nilai(jarak_model, 0, 255)
-            t = persentil(histogram(jarak_8bit, lain), 0.8)
-            jarak_model = np.minimum(jarak_model, jarak_warna(kotak, median_warna(kotak, lain * (jarak_8bit >= t))))
-        boleh = boleh * (jarak_model < BATAS_TUMBUH)
-
-    tumbuh = region_growing(asal, boleh, r)
-    tumbuh = opening(tumbuh, 5)                     # putus jembatan tipis ke plastik
-    # celah di sambungan kapsul (bayangan / kilau) ditutup closing ~0.5 x lebar
-    k = int(math.sqrt(d["luas"] / (math.pi * lonjong))) // 2 * 2 + 1
-    if k < 5:
-        k = 5
-    tumbuh = isi_lubang(closing(tumbuh + asal - tumbuh * asal, k))
-    _, daftar = label_region(tumbuh)
-    pilih = None
-    for b in daftar:
-        if pilih is None or b["luas"] > pilih["luas"]:
-            pilih = b
-    if pilih is None or pilih["luas"] <= d["luas"]:
-        return None
-    c = geser_region(pilih, y0, x0)
-    c["cy"], c["cx"], c["isi"], c["lonjong"] = momen_region(c["piksel"])
-    if c["isi"] < 0.8 or c["lonjong"] < 1.6 or c["lonjong"] > MAKS_LONJONG:
-        return None
-    beda = abs(sudut_sumbu(d["piksel"], cy, cx) - sudut_sumbu(c["piksel"], c["cy"], c["cx"]))
-    beda = beda * 180 / math.pi
-    if beda > 90:
-        beda = 180 - beda
-    if beda > MAKS_BEDA_SUDUT:
-        return None                                 # tumbuh ke samping, bukan memanjang
-    if not cek_dua_warna(img, c):
-        return None
-    c["kapsul"] = True
-    return c
-
-
-def segmen_lokal(img, cx, cy, r):
-    # Region obat kadang hanya sebagian (sisi yang terkena cahaya), jadi untuk
-    # NAMA BENTUK obat disegmentasi ulang di sekitar lingkarannya (materi 08):
-    #   warna pembanding = median warna cincin r*1.15..r*1.35 (foil di sekitar obat)
-    #   jarak warna setiap piksel ke pembanding -> threshold Otsu di dalam r*1.35
-    #   ambil region terbesar di dalam r*1.2, isi lubangnya
-    tinggi = img.shape[0]
-    lebar = img.shape[1]
-    R = int(r * 1.35) + 2
-    y0 = max(int(cy) - R, 0)
-    y1 = min(int(cy) + R + 1, tinggi)
-    x0 = max(int(cx) - R, 0)
-    x1 = min(int(cx) + R + 1, lebar)
-    kotak = img[y0:y1, x0:x1]
-    yy, xx = koordinat(y1 - y0, x1 - x0)
-    jarak_pusat = ((yy + y0 - cy) ** 2 + (xx + x0 - cx) ** 2) ** 0.5
-    cincin = (jarak_pusat > r * 1.15) * (jarak_pusat < r * 1.35)
-    if cincin.sum() < 10:
-        return None
-    jarak = jarak_warna(kotak, median_warna(kotak, cincin))
-    jarak_8bit = potong_nilai(jarak * 255 / (jarak.max() + 0.001), 0, 255)
-    T = otsu(histogram(jarak_8bit, jarak_pusat < r * 1.35))
-    mask = threshold(jarak_8bit, T) * (jarak_pusat < r * 1.2)
-    mask = isi_lubang(opening(mask, 3))
-    _, daftar = label_region(mask)
-    terbesar = None
+def ukuran_acuan(daftar):
+    # Obat dalam satu foto biasanya sejenis -> ukurannya mirip. Untuk setiap
+    # region dihitung kelompok region yang luasnya 0.6..1.67 kali luasnya;
+    # kelompok dengan TOTAL luas terbesar menjadi acuan (median luasnya).
+    acuan = 0
+    skor_terbaik = -1
     for d in daftar:
-        if terbesar is None or d["luas"] > terbesar["luas"]:
-            terbesar = d
-    if terbesar is None or terbesar["luas"] < MIN_INTI:
-        return None
-    piksel = []
-    for (y, x) in terbesar["piksel"]:
-        piksel.append((y + y0, x + x0))
-    return piksel
+        kel = [e["luas"] for e in daftar if 0.6 * d["luas"] <= e["luas"] <= 1.67 * d["luas"]]
+        if sum(kel) > skor_terbaik:
+            skor_terbaik = sum(kel)
+            acuan = nilai_tengah(kel)
+    return acuan
 
 
-def lengkapi_bentuk(d, img):
-    # deskripsi region (materi 09): chain code, keliling, pusat, jari-jari, nama bentuk
-    kode, titik = chain_code(d["piksel"])
+def nama_bentuk(d):
+    # nama bentuk dari deskriptor region (materi 09)
+    if d.get("kapsul"):
+        return "kapsul"
+    if d["lonjong"] < LONJONG_BULAT:
+        return "bulat"
+    if berwarna(d) and d["dK"] >= KROMA_KUAT:
+        return "kapsul"
+    return "kaplet / oval"
+
+
+def deskripsi_bentuk(c, d):
+    # chain code 8 arah -> keliling P; pusat (centroid); jari-jari lingkaran
+    # penutup = jarak Euclid terjauh dari pusat ke titik batas;
+    # kebundaran 4 pi A / P^2 (Gonzalez, 1 = lingkaran sempurna)
+    kode, titik = chain_code(d["piksel"], c.w)
     d["chain"] = kode
-    d["keliling"] = keliling(kode)
-    d["bundar"] = kebundaran(d["luas"], d["keliling"])
-    d["r"] = jari_jari(titik, d["cy"], d["cx"]) + 1.5     # +1.5 px agar lingkaran menutup obat
     d["titik_batas"] = titik
-    # nama bentuk dari outline hasil segmentasi ulang lokal (bila berhasil)
-    piksel_bentuk = segmen_lokal(img, d["cx"], d["cy"], d["r"])
-    if piksel_bentuk is None:
-        piksel_bentuk = d["piksel"]
-    cy, cx, isi, lonjong = momen_region(piksel_bentuk)
-    _, titik_bentuk = chain_code(piksel_bentuk)
-    seluruh = {"cy": cy, "cx": cx, "piksel": piksel_bentuk}
-    if d.get("kapsul", False):
-        d["bentuk"] = "kapsul"                   # gabungan 2 belahan beda warna
-    else:
-        d["bentuk"] = jenis_bentuk(titik_bentuk, cy, cx, lonjong, cek_dua_warna(img, seluruh))
-    d["titik_bentuk"] = titik_bentuk
+    d["keliling"] = keliling(kode)
+    d["kebundaran"] = 4 * PI * d["luas"] / (d["keliling"] ** 2) if d["keliling"] > 0 else 0
+    r = 0.0
+    for (x, y) in titik:
+        jarak = akar((x - d["cx"]) ** 2 + (y - d["cy"]) ** 2)
+        if jarak > r:
+            r = jarak
+    d["r"] = r + 2.0
+    # arah sumbu panjang elips setara (momen orde 2):
+    #   theta = 1/2 atan2( 2 mu11, mu20 - mu02 )   (derajat, sumbu y ke bawah)
+    d["sudut"] = 0.5 * arctan2(2 * d["m11"], d["m20"] - d["m02"]) * 180.0 / PI
+    d["bentuk"] = nama_bentuk(d)
     return d
 
 
 # ================================ ANALISIS ===================================
-def analisis(path):
-    mulai = time.time()
+def analisis_data(lebar0, tinggi0, data):
     langkah = []
-    nama = path.replace("\\", "/").split("/")[-1]
+    acuan, fa, kotak = tahap_a(lebar0, tinggi0, data, langkah)
+    c = tahap_b_awal(lebar0, tinggi0, data, acuan, fa, kotak, langkah)
+    kand = tahap_b_peta(c, langkah)
 
-    # ---------------------------------------------------------------- 1
-    asli = baca_gambar(path)
-    langkah.append(buat_langkah(
-        "Foto asli", "01 Introduction to DIP I", "Citra digital f(x,y), 24 bit RGB",
-        "f(x,y) = [R, G, B],  0 <= nilai <= 255",
-        "Foto HP dibaca sebagai matriks " + str(asli.shape[0]) + " x " + str(asli.shape[1]) +
-        " piksel dengan 3 kanal (R, G, B), masing-masing 8 bit (0..255). Foto sebesar ini terlalu "
-        "berat untuk diproses dengan rumus manual, jadi langkah berikutnya memperkecilnya.",
-        True, "rgb", asli))
-
-    # ---------------------------------------------------------------- 2
-    f_kecil = faktor_sampling(asli.shape[0], asli.shape[1], UKURAN_KERJA)
-    kecil = perkecil(asli, UKURAN_KERJA)
-    kecil = kecil[:kecil.shape[0] // 2 * 2, :kecil.shape[1] // 2 * 2]
-    langkah.append(buat_langkah(
-        "Perkecil foto (sampling)", "01 Introduction to DIP I", "Sampling (digitisasi koordinat)",
-        "g(m,n) = f(f*m, f*n),  f = " + str(f_kecil),
-        "Diambil 1 piksel setiap " + str(f_kecil) + " piksel sehingga foto menjadi " +
-        str(kecil.shape[0]) + " x " + str(kecil.shape[1]) + ". Gambar kecil ini hanya dipakai untuk "
-        "mencari letak blister. Sengaja tidak dirata-rata supaya noise salt & pepper tetap "
-        "terlihat dan bisa dideteksi pada langkah restorasi.",
-        True, "rgb", kecil))
-
-    # ---------------------------------------------------------------- 3
-    hue, sat, inten = rgb_ke_hsi(kecil)
-    rata_s = sat.sum() / sat.size
-    langkah.append(buat_langkah(
-        "Ruang warna HSI (saturasi)", "05 Color Image Processing", "Konversi RGB -> HSI",
-        "I = (R+G+B)/3;  S = 1 - 3 min(R,G,B)/(R+G+B);  H = theta (B<=G) / 360-theta",
-        "Setiap piksel diubah ke H (hue), S (saturasi) dan I (intensitas) dengan rumus slide 05. "
-        "Gambar menampilkan S: foil aluminium hampir tidak berwarna (S kecil, gelap di peta), "
-        "sedangkan meja kayu / benda berwarna punya S besar. Rata-rata S seluruh foto = " +
-        bulat(rata_s, 2) + ", rata-rata I = " + bulat(inten.sum() / inten.size, 0) +
-        ". I dan S dipakai bersama untuk mencari foil blister.",
-        True, "heat", sat))
-
-    # ---------------------------------------------------------------- 4
-    kecil_baik, kecil_bersih, cat_kecil = perbaiki_gambar(kecil.copy())
-    pakai_kecil = []
-    for n in daftar_perbaikan(cat_kecil):
-        if n.startswith("median") or n.startswith("DFT") or n.startswith("lowpass"):
-            pakai_kecil.append(n)
-    if len(pakai_kecil) > 0:
-        teks = "Filter yang dipakai: " + ", ".join(pakai_kecil) + "."
-    else:
-        teks = "Tidak ada noise yang perlu dibuang."
-    langkah.append(buat_langkah(
-        "Restorasi foto kecil", "06 Image Restoration", "Pemeriksaan noise otomatis",
-        "g = f + eta;  median / notch / lowpass bila perlu",
-        "Sebelum mencari blister, foto kecil diperiksa: salt & pepper " +
-        bulat(cat_kecil["salt"] * 100, 2) + "% (batas " + bulat(BATAS_SALT * 100, 0) +
-        "%), puncak spektrum " + bulat(cat_kecil["tertinggi"], 0) + "x median (batas " +
-        str(BATAS_PUNCAK) + "), noise patch datar " + bulat(cat_kecil["noise"], 2) +
-        " (batas " + str(BATAS_NOISE) + "). " + teks +
-        " Kontras sengaja belum diubah karena equalization membuat meja gelap ikut terang.",
-        len(pakai_kecil) > 0, "rgb", kecil_bersih))
-
-    # ---------------------------------------------------------------- 5
-    hue_bersih, sat_bersih, inten_bersih = rgb_ke_hsi(kecil_bersih)
-    warna_kulit, kulit = cari_kulit(hue_bersih, sat_bersih, inten_bersih)
-    blister = cari_blister(kecil_bersih, sat_bersih, inten_bersih, kulit)
-    langkah.append(buat_langkah(
-        "Skor foil: terang dan tidak berwarna", "08 Image Segmentation",
-        "Lowpass 7x7 + threshold Otsu (Otsu di luar slide)",
-        "skor = lowpass( I x (1 - S) );  foil bila skor > T",
-        "Foil blister itu terang dan tidak berwarna, jadi skor = intensitas I x (1 - saturasi S) "
-        "dari HSI (materi 05), "
-        "dihaluskan dengan lowpass rata-rata 7x7 (materi 03). Histogram skor dibagi dua dengan "
-        "T otomatis Otsu (cara memilih T dari Gonzalez, di luar slide) = " +
-        str(blister["batas_skor"]) + " (skala 0..255). Meja kayu (berwarna) dan meja gelap "
-        "mendapat skor kecil.",
-        True, "hist", None, blister["hist_skor"], blister["batas_skor"]))
-
-    # ---------------------------------------------------------------- 6
-    langkah.append(buat_langkah(
-        "Tekstur foil: kepadatan tepi Sobel", "08 Image Segmentation",
-        "Deteksi tepi Sobel + lowpass + Otsu (di luar slide)",
-        "grad f = |Gx| + |Gy|;  tekstur = lowpass 7x7(grad f)",
-        "Foil berpola dan mengkilap sehingga banyak tepi kecil; silau di meja terang tetapi halus. "
-        "Besar gradien Sobel dirata-rata 7x7 menjadi peta kepadatan tepi (gambar). "
-        "Threshold Otsu pada peta ini = " + str(blister["batas_tekstur"]) +
-        ". Piksel dianggap foil bila skor DAN tekstur sama-sama di atas threshold.",
-        True, "heat", blister["tekstur"]))
-
-    # ---------------------------------------------------------------- 7
-    langkah.append(buat_langkah(
-        "Area blister (ROI) dengan morfologi", "09 Representation & Description",
-        "Closing, isi lubang (di luar slide), opening, region terbesar",
-        "closing = dilasi lalu erosi (SE " + str(CLOSING_ROI) + "x" + str(CLOSING_ROI) +
-        ");  opening = erosi lalu dilasi (SE " + str(OPENING_ROI) + "x" + str(OPENING_ROI) + ")",
-        "Mask foil masih berlubang (kantong obat tidak bertekstur foil). Closing " +
-        str(CLOSING_ROI) + "x" + str(CLOSING_ROI) + " menyatukan foil, lubang yang tidak "
-        "tersambung ke tepi foto diisi (hole filling, Gonzalez). Daerah kulit/kayu (warna hangat, "
-        "region besar menyentuh tepi foto: " + bulat(kulit.sum() * 100 / kulit.size, 0) + "% foto) "
-        "dikeluarkan dari foil dan dari ROI agar jari yang menutupi blister tidak ikut, lalu opening " +
-        str(OPENING_ROI) + "x" + str(OPENING_ROI) + " memutus silau meja yang menempel. "
-        "Dari " + str(blister["jumlah_region"]) + " region (pelabelan N4) diambil yang terbesar"
-        + (" sebagai blister." if blister["ketemu"] else "; tetapi terlalu kecil, jadi seluruh foto dipakai."),
-        True, "mask", blister["roi"]))
-
-    # ---------------------------------------------------------------- 8
-    potong, roi_potong, f_potong = potong_blister(asli, kecil, blister["roi"])
-    langkah.append(buat_langkah(
-        "Potong blister dari foto asli", "01 Introduction to DIP I", "Cropping + sampling",
-        "kotak ROI x " + bulat(asli.shape[0] / kecil.shape[0], 1) + " -> foto asli, sampling f = " +
-        str(f_potong),
-        "Kotak pembatas ROI dibesarkan ke koordinat foto asli (resolusi penuh), ditambah margin " +
-        str(MARGIN_POTONG) + " px, lalu dipotong dan di-sampling 1 dari " + str(f_potong) +
-        " piksel menjadi " + str(potong.shape[0]) + " x " + str(potong.shape[1]) + ". Obat jadi "
-        "jauh lebih besar dibanding memakai foto kecil. Semua langkah berikutnya bekerja pada potongan ini.",
-        True, "rgb", potong))
-
-    # ------------------------------------------------------------ 9-12
-    img, bersih, cat = perbaiki_gambar(potong.copy())
-    langkah.append(buat_langkah(
-        "Cek salt & pepper -> median filter", "06 Image Restoration",
-        "Order-statistic filter: median 3x3 (materi 03)",
-        "persen = #(piksel 0/255 yang |f - median| > 50) / n",
-        "Noise impulse membuat piksel hitam/putih terisolasi. Dihitung piksel ekstrem (<= 8 atau "
-        ">= 247) yang beda lebih dari 50 dari median 3x3 tetangganya: " +
-        bulat(cat["salt"] * 100, 3) + "% (batas " + bulat(BATAS_SALT * 100, 0) + "%). " +
-        ("Karena di atas batas, median 3x3 dijalankan pada tiap kanal." if cat["median"]
-         else "Masih di bawah batas, jadi median filter dilewati agar detail tepi obat tidak hilang."),
-        cat["median"], "gray", ke_abu(potong)))
-
-    if cat["notch"]:
-        teks = (str(len(cat["puncak"])) + " pasang titik noise ditemukan, jadi dibuang dengan "
-                "Butterworth notch reject (D0 = " + str(RADIUS_NOTCH) + ", n = " + str(ORDE_NOTCH) +
-                ") lalu DFT balik.")
-    else:
-        teks = "Tidak ada titik noise, filter notch dilewati."
-    langkah.append(buat_langkah(
-        "Cek noise periodik -> DFT + notch", "04 Frequency Domain + 06 Image Restoration",
-        "DFT 2D, spektrum |F|, Butterworth notch reject",
-        "F(u,v) = sum f(x,y) e^{-j2pi(ux/M+vy/N)};  H = 1/(1+[D0^2/(D1 D2)]^n)",
-        "Noise periodik muncul sebagai titik terang di spektrum (gambar = log(1+|F|), F(0,0) di "
-        "tengah). Titik terkuat di luar radius " + str(RADIUS_PUSAT) + " bernilai " +
-        bulat(cat["tertinggi"], 0) + "x median spektrum (batas " + str(BATAS_PUNCAK) + "). " + teks,
-        cat["notch"], "spektrum", cat["spektrum"]))
-
-    langkah.append(buat_langkah(
-        "Estimasi noise di patch datar -> lowpass", "06 Image Restoration",
-        "Estimasi noise + mean filter (1/32)[1 3 1;3 16 3;1 3 1] (materi 03)",
-        "residu = f - (f_atas + f_bawah + f_kiri + f_kanan)/4;  noise = rata |residu| di blok datar",
-        "Gambar dibagi blok 8x8 dan dipilih blok yang paling datar (urutan 25%), supaya tepi "
-        "obat tidak dihitung sebagai noise. Noise terukur = " + bulat(cat["noise"], 2) +
-        " (batas " + str(BATAS_NOISE) + "). " +
-        ("Di atas batas, jadi lowpass 1/32 dari slide dijalankan." if cat["lowpass"]
-         else "Di bawah batas, jadi lowpass dilewati supaya tepi obat tetap tajam."),
-        cat["lowpass"], "gray", cat["abu_bersih"]))
-
-    perbaikan = []
-    if cat["equalization"]:
-        perbaikan.append("histogram equalization (rentang p1..p99 = " + str(cat["p99"] - cat["p1"]) +
-                         " < " + str(BATAS_RENTANG) + ")")
-    if cat["stretching"]:
-        perbaikan.append("contrast stretching [" + str(cat["p1"]) + ".." + str(cat["p99"]) +
-                         "] -> [0..255] karena std " + bulat(cat["std"], 1) + " < " + str(BATAS_STD))
-    if cat["gamma"] != 1.0:
-        perbaikan.append("gamma g = " + str(cat["gamma"]) + " karena rata-rata " +
-                         bulat(cat["rata_baru"], 0))
-    if len(perbaikan) > 0:
-        teks = "Dipakai: " + "; ".join(perbaikan) + "."
-    else:
-        teks = "Histogram sudah lebar dan terang cukup, jadi tidak diubah."
-    langkah.append(buat_langkah(
-        "Histogram & perbaikan kontras", "02 Image Enhancement",
-        "Histogram, equalization / contrast stretching / gamma",
-        "p(r_k) = n_k/n;  s_k = sum p(r_j);  stretching (r1,0)-(r2,255);  T(r) = ((r-r1)/(r2-r1))^g",
-        "Histogram potongan: rata-rata " + bulat(cat["rata"], 0) + ", std " + bulat(cat["std"], 1) +
-        ", 1% tergelap <= " + str(cat["p1"]) + ", 1% terterang >= " + str(cat["p99"]) + ". " + teks +
-        " Garis = rata-rata keabuan.",
-        len(perbaikan) > 0, "hist", None, cat["hist_awal"], int(round(cat["rata"]))))
-
-    # ---------------------------------------------------------------- 13
-    # pantulan cahaya: putih jenuh di ketiga kanal (graylevel slicing pada min(R,G,B))
-    kilau = graylevel_slicing(minimum_rgb(bersih), BATAS_KILAU, 255)
-    zona_silau = dilasi(kilau, LEBAR_SILAU)
-    langkah.append(buat_langkah(
-        "Zona silau (pantulan cahaya)", "02 Image Enhancement + 09 Morfologi",
-        "Graylevel slicing + dilasi",
-        "silau = 1 bila min(R,G,B) >= " + str(BATAS_KILAU) + ";  zona = dilasi " +
-        str(LEBAR_SILAU) + "x" + str(LEBAR_SILAU),
-        "Pantulan lampu di plastik/foil membuat ketiga kanal jenuh. Graylevel slicing rentang [" +
-        str(BATAS_KILAU) + "..255] pada min(R,G,B) menandai " + bulat(kilau.sum(), 0) +
-        " piksel, lalu dilasi " + str(LEBAR_SILAU) + "x" + str(LEBAR_SILAU) +
-        " ikut menandai pinggiran pantulan. Region yang >= " + bulat(MAKS_KILAU * 100, 0) +
-        "% berada di zona ini nanti ditolak sebagai pantulan.",
-        True, "mask", zona_silau))
-
-    # ---------------------------------------------------------- 13b
-    # tangan / jari: warna hangat + region besar yang menyentuh tepi potongan
-    # (berlanjut ke luar blister). Obat tidak pernah menyentuh tepi potongan.
-    hue_p, sat_p, inten_p = rgb_ke_hsi(bersih)
-    hangat_p, kulit_p = cari_kulit(hue_p, sat_p, inten_p)
-    kulit_p = dilasi(kulit_p, LEBAR_KULIT)
-    roi_awal = roi_potong
-    roi_potong = roi_potong * (1 - kulit_p)
-    langkah.append(buat_langkah(
-        "Buang tangan / jari (kulit)", "05 Color Image Processing + 08 Segmentation + 09 Morfologi",
-        "HSI threshold, opening, pelabelan region, dilasi",
-        "kulit = (" + str(KULIT_H[0]) + " <= H <= " + str(KULIT_H[1]) +
-        ") AND S >= " + str(KULIT_S) + " AND I >= " + str(KULIT_I) +
-        ";  dipakai bila region > " + bulat(MIN_KULIT * 100, 0) + "% dan menyentuh tepi",
-        "Kulit tangan dan kayu berwarna hangat (hue " + str(KULIT_H[0]) + ".." + str(KULIT_H[1]) +
-        " derajat) dengan saturasi >= " + str(KULIT_S) +
-        ". Obat krem/oranye juga hangat, jadi dipakai juga STRUKTUR: setelah opening " +
-        str(OPENING_KULIT) + "x" + str(OPENING_KULIT) + ", hanya region yang luasnya > " +
-        bulat(MIN_KULIT * 100, 0) + "% potongan DAN menyentuh pita " + str(PITA_KULIT) +
-        " px di tepi potongan yang dianggap tangan/meja (obat selalu di dalam blister, tidak sampai "
-        "tepi). Region itu didilasi " + str(LEBAR_KULIT) + "x" + str(LEBAR_KULIT) +
-        " lalu dikeluarkan dari ROI: " + bulat((roi_awal * kulit_p).sum() * 100 / (roi_awal.sum() + 1), 1) +
-        "% ROI dibuang.",
-        True, "mask", kulit_p))
-
-    # ---------------------------------------------------------------- 14
-    roi = roi_potong
-    abu = ke_abu(img)
-    std = std_lokal(abu, JENDELA_STD)
-    std_8bit = potong_nilai(std * 255 / SKALA_STD, 0, 255)
-    batas_std = otsu(histogram(std_8bit))
-    halus = (std_8bit < batas_std) * roi
-    kasar = (std_8bit >= batas_std) * roi
-    langkah.append(buat_langkah(
-        "Kehalusan permukaan (std lokal)", "03 Spatial Filtering + 08 Segmentation",
-        "Dua lowpass rata-rata 5x5 -> simpangan baku lokal, threshold Otsu (di luar slide)",
-        "std = sqrt( mean(f^2) - mean(f)^2 )  di jendela " + str(JENDELA_STD) + "x" + str(JENDELA_STD),
-        "Permukaan obat halus, foil aluminium kasar (banyak kilau kecil). Simpangan baku lokal "
-        "dihitung dari lowpass f dan f^2, diskalakan (std " + str(SKALA_STD) + " -> 255), lalu "
-        "dibagi dengan Otsu: T = " + str(batas_std) + ". Di dalam blister " +
-        bulat(halus.sum() * 100 / (roi.sum() + 1), 0) + "% piksel halus (calon obat) dan sisanya kasar (foil).",
-        True, "heat", std_8bit))
-
-    # ---------------------------------------------------------------- 15
-    warna_foil = median_warna(img, kasar)
-    jarak_foil = jarak_warna(img, warna_foil)
-    luar = 1 - dilasi(roi, 9)
-    warna_meja = None
-    jarak_meja = None
-    if luar.sum() > 0.03 * abu.size:
-        warna_meja = median_warna(img, luar)
-        jarak_meja = jarak_warna(img, warna_meja)
-
-    inti = halus * (jarak_foil > BEDA_FOIL)
-    if jarak_meja is not None:
-        inti = inti * (jarak_meja > BEDA_MEJA)
-    tepi = sobel(abu)
-    tepi_skala = tepi * 255 / (tepi.max() + 0.001)
-    p99 = persentil(histogram(tepi_skala), 0.99)          # 1% tepi terkuat = 255
-    tepi_8bit = potong_nilai(tepi_skala * 255 / (p99 + 1), 0, 255)
-    batas_tepi = otsu(histogram(tepi_8bit, roi))
-    inti = inti * (tepi_8bit < batas_tepi)
-    inti = opening(inti, 5)
-    if warna_meja is not None:
-        teks_meja = ("warna meja (median di luar blister) = " + str(warna_meja) +
-                     ", piksel yang jaraknya < " + str(BEDA_MEJA) + " dibuang (kantong kosong menampakkan meja)")
-    else:
-        teks_meja = "meja hampir tidak terlihat, jadi cek warna meja dilewati"
-    langkah.append(buat_langkah(
-        "Calon obat: halus & beda warna dari foil", "05 Color + 08 Segmentation",
-        "Jarak warna Euclid, threshold, Sobel, opening 5x5",
-        "calon = halus AND De(warna, foil) > " + str(BEDA_FOIL) + " AND grad f < T_tepi",
-        "Warna foil = median RGB daerah kasar = " + str(warna_foil) + ". Calon obat adalah piksel "
-        "halus yang jarak Euclid warnanya ke foil > " + str(BEDA_FOIL) + " (obat putih, kuning, "
-        "merah... semua bisa); " + teks_meja + ". Piksel di tepi Sobel kuat (T Otsu = " +
-        str(batas_tepi) + ") dibuang agar obat terpisah dari pantulan, lalu opening 5x5 membuang bintik.",
-        True, "mask", inti))
-
-    # ---------------------------------------------------------------- 16
-    luas_roi = roi.sum()
-    roi_okta = bungkus_oktagon(roi) * (1 - kulit_p)
-    label_calon, daftar_calon = label_region(inti)
+    # ---------------------------------------------------------------- B7
+    _, daftar = label_region(kand, c.w, c.h, 8)
+    terima = []
+    tolak = []
+    catatan_belah = {}
+    n_awal = 0
+    for d in daftar:
+        if d["luas"] >= c.min_luas:
+            n_awal += 1
+            evaluasi(c, d["piksel"], 0, terima, tolak, catatan_belah)
     hitung = {}
-    inti_lolos = np.zeros(abu.shape)
-    for d in daftar_calon:
-        if d["luas"] < MIN_INTI:
-            continue
-        for b in pecah_dan_nilai(img, roi_okta, d, luas_roi, 0, jarak_meja, warna_meja, hitung):
-            for (y, x) in b["piksel"]:
-                inti_lolos[y, x] = 1
-    inti_lolos = opening(isi_lubang(closing(inti_lolos, 9)), 5)
-    teks = []
-    for alasan in hitung:
-        teks.append(alasan + " " + str(hitung[alasan]))
-    langkah.append(buat_langkah(
-        "Penilaian setiap calon (seed)", "09 Representation & Description",
-        "Luas, momen (di luar slide), cincin dilasi, HSI calon vs cincin vs meja, opening bertingkat",
-        "cincin = dilasi(A, " + str(2 * LEBAR_CINCIN + 5) + ") - dilasi(A, 5);  beda warna dalam vs cincin > " +
-        str(BEDA_SEKITAR) + ";  lubang: I_dalam < I_cincin dan jarak ke abu-abu < " + str(BATAS_ABU) +
-        ";  tembus: |H_dalam - H_meja| < " + str(BEDA_HUE_MEJA),
-        "Setiap calon dinilai: luas wajar, bentuk kompak (momen orde 2, Gonzalez), >= " +
-        bulat(MIN_DIKELILINGI * 100, 0) + "% cincinnya di dalam blister, warnanya beda > " +
-        str(BEDA_SEKITAR) + " dari cincin, tepi Sobel tegas (> " + str(MIN_TAJAM) + "), dan "
-        "cincinnya bukan warna meja. Dengan HSI (materi 05) median warna calon dibandingkan: "
-        "calon yang LEBIH GELAP (I) dari cincinnya dan tidak berwarna (jarak RGB ke sumbu abu-abu "
-        "(I,I,I) < " + str(BATAS_ABU) + ") adalah lubang foil sobek / bayangan / celah gelap "
-        "('lubang'); calon yang hue H-nya beda < " + str(BEDA_HUE_MEJA) + " derajat dari hue meja "
-        "(keduanya S >= " + str(MIN_S_HUE) + ") adalah kantong kosong yang menampakkan meja tembus "
-        "plastik - plastik hanya mengubah kecerahan, bukan hue ('tembus'). Calon yang menempel ke foil dipecah dengan opening " +
-        str(PISAH_BERTINGKAT) + ". Hasil penilaian: " + ", ".join(teks) + ".",
-        True, "mask", inti_lolos))
+    for d in tolak:
+        hitung[d["alasan"]] = hitung.get(d["alasan"], 0) + 1
+    teks_tolak = ", ".join(k + " " + str(v) for k, v in sorted(hitung.items())) or "-"
+    teks_belah = ", ".join(k + " " + str(v) + "x" for k, v in sorted(catatan_belah.items())) or "tidak ada"
+    langkah.append(langkah_baru(
+        "Pelabelan, penilaian & region splitting", "02 Konektivitas + 08 Segmentasi + 09 Deskripsi",
+        "Label N8, momen (luas, keterisian, kelonjongan), cincin pembanding, aturan; region splitting Otsu",
+        "cincin = dilasi(A, " + str(2 * LEBAR_CINCIN + 1) + ") - dilasi(A, 3);  obat putih: dY >= " +
+        str(BEDA_TERANG) + " dan Y >= " + bulat(TERANG_FOIL, 2) + " Yf;  obat berwarna: dK >= " +
+        str(BEDA_KROMA),
+        "Kandidat dilabeli dengan konektivitas N8: " + str(n_awal) + " region. Setiap region diberi "
+        "deskriptor: luas A, keterisian A / luas elips setara dan kelonjongan (momen orde 2, Gonzalez), "
+        "lalu dibandingkan dengan CINCIN di sekelilingnya (dinding kantong / foil). Aturan: luas wajar "
+        "(<= " + bulat(MAKS_LUAS_ROI * 100, 0) + "% blister), bentuk rapi (keterisian >= " +
+        bulat(MIN_ISI, 2) + ", kelonjongan <= " + bulat(MAKS_LONJONG, 1) + "), cincinnya di dalam blister dan "
+        "berwarna foil, obat putih lebih terang >= " + str(BEDA_TERANG) + " dari cincin DAN >= " +
+        bulat(TERANG_FOIL, 2) + " x kecerahan foil, obat berwarna beda kroma >= " + str(BEDA_KROMA) +
+        ", dan tidak berwarna latar (kantong kosong yang menampakkan meja). Region yang gagal dibelah "
+        "dua dengan Otsu di dalam region pada fitur yang paling memisahkan (region splitting, slide 08): " +
+        teks_belah + ". Diterima " + str(len(terima)) + " region (hijau), ditolak: " + teks_tolak + " (merah).",
+        g_overlay(c, [(tolak, (255, 70, 70), False), (terima, (60, 255, 100), True)])))
 
-    # ---------------------------------------------------------------- 17
-    label_inti, daftar_inti = label_region(inti_lolos)
-    obat_mask = np.zeros(abu.shape)
-    n_bocor = 0
-    n_seed = 0
-    for d in daftar_inti:
-        if d["luas"] < MIN_INTI:
-            continue
-        n_seed += 1
-        tumbuh, bocor = tumbuhkan_obat(img, label_inti, d, jarak_foil, jarak_meja, roi, obat_mask)
-        if bocor:
-            n_bocor += 1
-        obat_mask = obat_mask + tumbuh
-        obat_mask[obat_mask > 1] = 1
-    obat_mask = isi_lubang(closing(obat_mask, 5))     # kapsul 2 warna disatukan lagi
-    langkah.append(buat_langkah(
-        "Region growing dari setiap seed", "08 Image Segmentation", "Region growing (N8)",
-        "q ikut region bila De(f(q), warna seed) < " + str(BATAS_TUMBUH) +
-        " dan lebih mirip obat daripada foil/meja",
-        "Dari " + str(n_seed) + " seed, region dilebarkan 1 piksel per putaran (maks " +
-        str(LANGKAH_TUMBUH) + " putaran) ke tetangga N8 yang warnanya mirip rata-rata seed. "
-        "Hasilnya mengikuti bentuk asli obat (bulat, lonjong, kapsul). " + str(n_bocor) +
-        " region bocor ke foil (> " + bulat(MAKS_TUMBUH, 0) + "x seed atau bentuk rusak) sehingga "
-        "kembali ke seed-nya.",
-        True, "mask", obat_mask))
+    # ---------------------------------------------------------------- B8
+    terima, n_gabung, n_lengkap = gabung_kapsul(c, terima, tolak)
+    kapsul = [d for d in terima if d.get("kapsul")]
+    langkah.append(langkah_baru(
+        "Gabung belahan kapsul", "09 Morfologi (closing) + 05 Warna",
+        "Closing menyatukan dua belahan beda warna; region growing ke belahan putih",
+        "syarat: satu belahan berwarna (dK >= " + str(WARNA_KAPSUL) + " atau S >= " + bulat(JENUH, 2) +
+        "), luas 0.4..2.5x, closing -> 1 region, keterisian >= 0.8, kelonjongan <= 4",
+        "Kapsul punya dua belahan dengan warna berbeda (mis. merah | putih) dan di antaranya ada garis "
+        "sambungan, sehingga terdeteksi sebagai DUA region. Dua region berdekatan yang salah satunya "
+        "berwarna disatukan dengan closing (dilasi lalu erosi, slide 09: 'menggabungkan 2 objek yang salah "
+        "menjadi sebuah objek yang benar'); hasilnya dipakai hanya bila berbentuk kapsul. Belahan berwarna "
+        "yang diterima sendirian dilengkapi dengan belahan putihnya yang tadi ditolak. Disatukan: " +
+        str(n_gabung) + ", dilengkapi: " + str(n_lengkap) + ".",
+        g_overlay(c, [(kapsul, (255, 200, 40), True), ([d for d in terima if not d.get("kapsul")], (60, 255, 100), True)]),
+        n_gabung + n_lengkap > 0))
 
-    # ---------------------------------------------------------------- 18
-    tinggi = abu.shape[0]
-    lebar = abu.shape[1]
-    _, daftar_awal = label_region(obat_mask, 4)
-    daftar = []
-    for d in daftar_awal:
-        if d["luas"] >= MIN_INTI:
-            daftar = daftar + pisahkan_sambungan(d, tinggi, lebar)
-    # belahan kapsul yang beda warna (mis. merah | putih) disatukan -> 1 butir
-    daftar, n_gabung = gabung_kapsul(daftar, potong, tinggi, lebar)
-    # kapsul yang baru tertangkap sebagian dilengkapi (region growing lagi)
-    mirip_obat = (jarak_foil > BEDA_FOIL) * 1.0
-    if jarak_meja is not None:
-        mirip_obat = mirip_obat * (jarak_meja > BEDA_MEJA)
-    halus_semua = (std_8bit < batas_std) * (tepi_8bit < batas_tepi)
-    mirip_obat = (halus_semua + mirip_obat - halus_semua * mirip_obat) * roi_okta
-    mirip_obat = opening(mirip_obat, 5)             # bintik foil dibuang
-    # region diproses dari yang terbesar; piksel kapsul yang sudah jadi
-    # tidak boleh diambil region lain
-    urut = []
-    for d in daftar:
-        urut.append((d["luas"], len(urut), d))
-    urut.sort(reverse=True)
-    sudah = np.zeros((tinggi, lebar))
-    baru = []
-    n_lengkap = 0
-    for (_, _, d) in urut:
-        n_dalam = 0
-        for (y, x) in d["piksel"]:
-            n_dalam += sudah[y, x]
-        if n_dalam > 0.5 * d["luas"]:
-            continue                                # sudah termasuk kapsul lain
-        c = None
-        n_kilau = 0
-        for (y, x) in d["piksel"]:
-            n_kilau += zona_silau[y, x]
-        # hanya region yang bukan pantulan dan tidak terlalu kecil
-        layak = n_kilau < MAKS_KILAU * d["luas"] and d["luas"] >= MIN_LUAS_ROI * roi.sum()
-        if layak and not d.get("kapsul", False):
-            c = lengkapi_kapsul(d, potong, mirip_obat, sudah, tinggi, lebar, False)
-            if c is None:
-                c = lengkapi_kapsul(d, potong, mirip_obat, sudah, tinggi, lebar, True)
-        if c is not None:
-            d = c
-            n_lengkap += 1
-        for (y, x) in d["piksel"]:
-            sudah[y, x] = 1
-        baru.append(d)
-    daftar = baru
-
-    calon = []
-    ditolak = []
-    for d in daftar:
-        d["cy"], d["cx"], d["isi"], d["lonjong"] = momen_region(d["piksel"])
-        n_kilau = 0
-        for (y, x) in d["piksel"]:
-            n_kilau += zona_silau[y, x]
-        d["kilau"] = n_kilau / d["luas"]
-        if d["kilau"] >= MAKS_KILAU:
-            d["alasan"] = "pantulan"
-            ditolak.append(d)
-        elif d["luas"] < MIN_LUAS_ROI * luas_roi:
-            d["alasan"] = "serpihan"
-            ditolak.append(d)
-        elif d["isi"] < MIN_ISI:
-            d["alasan"] = "bentuk"
-            ditolak.append(d)
-        elif d["lonjong"] > MAKS_LONJONG:
-            d["alasan"] = "lonjong"
-            ditolak.append(d)
-        else:
-            calon.append(d)
-
-    # aturan ukuran: obat dalam satu blister sama besar
+    # ---------------------------------------------------------------- B9
     obat = []
-    jumlah = 0
-    median_luas = 0
-    if len(calon) > 0:
-        # patokan ukuran = median luas calon (bukan yang terbesar: tangan /
-        # foil yang ikut terdeteksi bisa jauh lebih besar dari obat)
-        semua_luas = []
-        for d in calon:
-            semua_luas.append(d["luas"])
-        patokan = nilai_tengah(semua_luas)
-        sisa = []
-        for d in calon:
-            if d["luas"] < BATAS_KECIL * patokan:
-                d["alasan"] = "kecil"
-                ditolak.append(d)
-            elif d["luas"] > MAKS_KALI_MEDIAN * patokan and not d.get("kapsul", False):
-                d["alasan"] = "besar"
-                ditolak.append(d)
-            else:
-                sisa.append(d)
-        if len(sisa) > 0:
-            semua_luas = []
-            for d in sisa:
-                semua_luas.append(d["luas"])
-            median_luas = nilai_tengah(semua_luas)
-            for d in sisa:
-                if d["luas"] < BATAS_KECIL_MEDIAN * median_luas:
-                    d["alasan"] = "kecil"
-                    ditolak.append(d)
-                    continue
-                d["butir"] = 1
-                # kapsul gabungan 2 belahan = tetap 1 butir walaupun luasnya besar
-                if (d["luas"] >= BATAS_DOBEL * median_luas and d["isi"] >= MIN_ISI_DOBEL
-                        and not d.get("kapsul", False)):
-                    d["butir"] = int(round(d["luas"] / median_luas))
-                jumlah += d["butir"]
-                obat.append(d)
+    acuan_luas = ukuran_acuan(terima) if terima else 0
+    for d in terima:
+        if d["luas"] < KECIL_ACUAN * acuan_luas:
+            d["alasan"] = "kecil"
+            tolak.append(d)
+        elif d["luas"] > BESAR_ACUAN * acuan_luas and not d.get("kapsul"):
+            d["alasan"] = "besar"
+            tolak.append(d)
+        else:
+            obat.append(d)
+    n_ukuran = len(terima) - len(obat)
+    id_obat = set(id(d) for d in obat)
+    langkah.append(langkah_baru(
+        "Konsistensi ukuran", "09 Representation & Description",
+        "Luas acuan = median kelompok luas yang paling dominan",
+        "acuan = " + str(acuan_luas) + " px;  ditolak bila A < " + bulat(KECIL_ACUAN, 1) + " x acuan atau A > " +
+        bulat(BESAR_ACUAN, 1) + " x acuan",
+        "Obat dalam satu foto biasanya sejenis sehingga luasnya mirip. Untuk setiap region dicari region "
+        "lain yang luasnya 0.6..1.67 kali; kelompok dengan total luas terbesar dipakai sebagai acuan "
+        "(median luasnya = " + str(acuan_luas) + " piksel). Serpihan (< " + bulat(KECIL_ACUAN, 1) +
+        "x) dan benda yang terlalu besar (> " + bulat(BESAR_ACUAN, 1) + "x) ditolak: " + str(n_ukuran) + " region.",
+        g_overlay(c, [(obat, (60, 255, 100), True), ([d for d in terima if id(d) not in id_obat], (255, 70, 70), False)]),
+        n_ukuran > 0))
 
-    for d in obat + ditolak:
-        lengkapi_bentuk(d, potong)
+    # ---------------------------------------------------------------- B10
+    for d in obat:
+        deskripsi_bentuk(c, d)
+    obat.sort(key=lambda d: (int(d["cy"] / max(1.0, 2 * d["b"])), d["cx"]))   # urut baris lalu kolom
+    R = [int(v * 0.5) for v in c.R]
+    G = [int(v * 0.5) for v in c.G]
+    B = [int(v * 0.5) for v in c.B]
+    for d in obat:
+        for (x, y) in d["titik_batas"]:
+            i = y * c.w + x
+            R[i], G[i], B[i] = 60, 255, 100
+        x, y = d["titik_batas"][0]
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if 0 <= x + dx < c.w and 0 <= y + dy < c.h:
+                    i = (y + dy) * c.w + x + dx
+                    R[i], G[i], B[i] = 255, 230, 0
+    teks = []
+    for k, d in enumerate(obat):
+        teks.append("#" + str(k + 1) + " " + d["bentuk"] + ": A=" + str(d["luas"]) + ", P=" + bulat(d["keliling"], 0) +
+                    ", 4piA/P^2=" + bulat(d["kebundaran"], 2) + ", lonjong=" + bulat(d["lonjong"], 2))
+    langkah.append(langkah_baru(
+        "Chain code & deskripsi bentuk", "09 Representation & Description",
+        "Chain code 8 arah, keliling, centroid, kelonjongan, kebundaran",
+        "P = #kode genap + sqrt(2) x #kode ganjil;  pusat = rata-rata (x, y);  4 pi A / P^2;  "
+        "bulat bila lonjong < " + bulat(LONJONG_BULAT, 2),
+        "Batas luar setiap obat ditelusuri dengan chain code 8 arah (3 2 1 / 4 x 0 / 5 6 7, slide 09; "
+        "titik kuning = titik awal). Dari chain code dihitung keliling P (kode genap = 1 langkah, kode "
+        "ganjil = sqrt 2). Nama bentuk: kelonjongan < " + bulat(LONJONG_BULAT, 2) + " -> bulat, region "
+        "gabungan dua warna -> kapsul, selain itu kaplet / oval. " + ("; ".join(teks) + "." if teks else
+                                                                   "Tidak ada obat."),
+        g_rgb(c.w, c.h, R, G, B), len(obat) > 0))
 
-    # gambar batas (chain code) di atas potongan: hijau = obat, merah = ditolak
-    gambar_batas = potong_nilai(potong, 0, 255) * 0.6
-    for d in ditolak:
-        # region ditolak: batas = A - erosi(A), diwarnai merah
-        garis = batas(mask_dari_piksel(d["piksel"], tinggi, lebar))
-        for c in range(3):
-            kanal = gambar_batas[:, :, c]
-            kanal[garis > 0.5] = [255, 60, 60][c]
-    for d in obat:
-        for (y, x) in d["titik_batas"]:
-            gambar_batas[y, x] = [60, 255, 90]
-        y, x = d["titik_batas"][0]
-        gambar_batas[max(y - 1, 0):y + 2, max(x - 1, 0):x + 2] = [255, 255, 0]
-    teks_obat = []
-    nomor = 0
-    for d in obat:
-        nomor += 1
-        teks_obat.append("#" + str(nomor) + " (" + d["bentuk"] + "): A=" + str(d["luas"]) + ", P=" + bulat(d["keliling"], 0) +
-                         ", 4piA/P^2=" + bulat(d["bundar"], 2) + ", r=" + bulat(d["r"], 0) +
-                         (", " + str(d["butir"]) + " butir" if d["butir"] > 1 else ""))
-    teks_tolak = []
-    for d in ditolak:
-        teks_tolak.append(d["alasan"])
-    langkah.append(buat_langkah(
-        "Pelabelan N4, batas & chain code, aturan", "09 Representation & Description + 02 Intro II",
-        "Label N4, chain code 8 arah, keliling, centroid, jari-jari De, momen (di luar slide)",
-        "P = #genap + sqrt(2) #ganjil;  pusat = rata-rata (x, y);  r = maks De(pusat, batas);  "
-        "butir = round(A / median A) bila A >= " + str(BATAS_DOBEL) + " median",
-        "Region diberi label (N4). Dua region yang berdekatan (celah <= " + str(KALI_CELAH_KAPSUL) +
-        " x lebar belahan), warnanya beda > " + str(BEDA_DUA_WARNA) + " dan gabungannya berbentuk kapsul (lonjong 1.6.." +
-        str(MAKS_LONJONG) + ", isi elips >= 0.8) adalah dua belahan SATU kapsul, jadi disatukan dengan "
-        "closing: " + str(n_gabung) + " kapsul disatukan. Kapsul yang baru tertangkap sebagian (region lonjong >= " +
-        str(MIN_LONJONG_BELAHAN) + ") digrowing lagi ke piksel mirip obat (halus, atau warnanya jauh dari foil " +
-        "dan meja); bila perlu hanya ke piksel yang dekat warna belahan region atau warna belahan kedua (20% piksel " +
-        "cincin yang paling beda warna). Hasil dipakai hanya bila berbentuk kapsul dua warna (lonjong 1.6.." +
-        str(MAKS_LONJONG) + ", isi >= 0.8, sumbu bergeser <= " + str(MAKS_BEDA_SUDUT) + " derajat): " +
-        str(n_lengkap) + " kapsul dilengkapi. 4piA/P^2 (kebundaran, Gonzalez) hanya informasi, tidak dipakai menyaring. Batas obat (hijau) ditelusuri dengan chain code 8 arah (titik kuning = "
-        "awal), batas region ditolak (merah) = A - erosi(A). "
-        "Aturan: tolak bila >= " + bulat(MAKS_KILAU * 100, 0) + "% di zona silau, luas < " +
-        bulat(MIN_LUAS_ROI * 100, 1) + "% blister, isi elips < " + str(MIN_ISI) + ", lonjong > " +
-        str(MAKS_LONJONG) + ", atau jauh lebih kecil dari obat lain. Median luas obat = " +
-        str(median_luas) + " px. " +
-        ("Diterima: " + "; ".join(teks_obat) + ". " if len(teks_obat) > 0 else "Tidak ada region yang diterima. ") +
-        ("Ditolak: " + ", ".join(teks_tolak) + "." if len(teks_tolak) > 0 else "Tidak ada yang ditolak."),
-        True, "rgb", gambar_batas))
-
-    # ---------------------------------------------------------------- 19
-    gambar_akhir = potong_nilai(potong, 0, 255)
-    for d in obat:
-        gambar_lingkaran(gambar_akhir, d["cx"], d["cy"], d["r"], [40, 230, 80], 3)
-    # hitung jumlah obat per bentuk
+    # ---------------------------------------------------------------- B11
     per_bentuk = {}
     for d in obat:
-        if d["bentuk"] in per_bentuk:
-            per_bentuk[d["bentuk"]] += d["butir"]
-        else:
-            per_bentuk[d["bentuk"]] = d["butir"]
-    teks_bentuk = []
-    for nama_bentuk in per_bentuk:
-        teks_bentuk.append(nama_bentuk + " " + str(per_bentuk[nama_bentuk]))
-    langkah.append(buat_langkah(
-        "Hasil: lingkaran & bentuk setiap sisa obat", "09 Representation & Description",
-        "Lingkaran dari centroid & jari-jari; bentuk dari momen, signature & warna",
-        "x = cx + r cos t,  y = cy + r sin t;  signature r(i) = De(pusat, batas ke-i);  sudut = puncak r(i)",
-        "Setiap obat diberi lingkaran berpusat di centroid dengan jari-jari = jarak Euclid terjauh "
-        "dari pusat ke batasnya, sehingga lingkaran menutupi seluruh obat. Nama bentuk: lonjong >= 1.35 "
-        "(momen) -> kapsul bila kedua belahannya beda warna > " + str(BEDA_DUA_WARNA) + ", selain itu oval / "
-        "kaplet; signature (jarak pusat ke batas sepanjang chain code) hampir datar -> bulat; jumlah "
-        "puncak signature = jumlah sudut (3 segitiga, 4 persegi, ...). Jumlah region obat = " +
-        str(len(obat)) + ", total butir = " + str(jumlah) + " (region seluas ~2x median dihitung 2 butir)" +
-        (". Per bentuk: " + ", ".join(teks_bentuk) + "." if len(teks_bentuk) > 0 else "."),
-        True, "rgb", gambar_akhir))
+        per_bentuk[d["bentuk"]] = per_bentuk.get(d["bentuk"], 0) + 1
+    teks_bentuk = ", ".join(k + " " + str(v) for k, v in per_bentuk.items())
+    langkah.append(langkah_baru(
+        "Hasil: sisa obat", "09 Representation & Description",
+        "Elips setara dari momen: pusat, sumbu a & b, arah theta",
+        "pusat = (rata x, rata y);  a = 2 sqrt(lambda1), b = 2 sqrt(lambda2);  theta = 1/2 atan2(2 mu11, mu20 - mu02)",
+        "Setiap obat ditandai ELIPS SETARA dari momen orde 2 region-nya (Gonzalez): pusat = centroid, "
+        "setengah sumbu a dan b dari nilai eigen lambda1, lambda2, dan arah sumbu panjang theta. Elips ini "
+        "mengikuti bentuk obat (bulat, kaplet, kapsul) dan kemiringannya. SISA OBAT = " + str(len(obat)) +
+        (" (" + teks_bentuk + ")." if teks_bentuk else "."),
+        {"jenis": "hasil"}))
 
-    hasil_obat = []
-    for d in obat:
-        hasil_obat.append({"cx": d["cx"], "cy": d["cy"], "r": d["r"], "butir": d["butir"],
-                           "bentuk": d["bentuk"]})
+    hasil_obat = [{"cx": d["cx"], "cy": d["cy"], "r": d["r"], "a": d["a"], "b": d["b"], "sudut": d["sudut"],
+                   "bentuk": d["bentuk"], "luas": d["luas"],
+                   "keliling": d["keliling"], "kebundaran": d["kebundaran"], "lonjong": d["lonjong"],
+                   "x0": d["x0"], "y0": d["y0"], "x1": d["x1"], "y1": d["y1"]} for d in obat]
     hasil_tolak = []
-    for d in ditolak:
-        hasil_tolak.append({"cx": d["cx"], "cy": d["cy"], "r": d["r"], "alasan": d["alasan"]})
-
-    return {"nama": nama, "jumlah": jumlah, "waktu": time.time() - mulai,
-            "foto": potong_nilai(potong, 0, 255), "obat": hasil_obat, "ditolak": hasil_tolak,
-            "langkah": langkah}
+    for d in tolak:
+        if d["luas"] >= 0.5 * max(acuan_luas, c.min_luas):
+            hasil_tolak.append({"cx": d["cx"], "cy": d["cy"], "alasan": d["alasan"],
+                                "r": max(d["x1"] - d["x0"], d["y1"] - d["y0"]) / 2.0 + 2})
+    return {"jumlah": len(obat), "obat": hasil_obat, "ditolak": hasil_tolak, "langkah": langkah,
+            "foto": g_rgb(c.w, c.h, c.R, c.G, c.B), "kotak": c.kotak, "faktor": c.f,
+            "acuan_luas": acuan_luas, "Yf": c.Yf,
+            "_obat_lengkap": obat, "_tolak_lengkap": tolak}

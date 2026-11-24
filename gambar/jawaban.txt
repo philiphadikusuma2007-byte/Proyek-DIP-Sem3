@@ -1,12 +1,20 @@
-# nama_file | jumlah obat tersisa (dihitung manual dari foto)
+# nama_file | jumlah obat yang TERLIHAT di foto (dihitung manual)
+# Obat yang tertutup jari / benda lain tidak dihitung (tidak terlihat).
 IMG_20261109_080312.jpg|6
 IMG_20261109_080320.jpg|5
 IMG_20261109_080332.jpg|0
 IMG_20261109_080346.jpg|4
 IMG_20261109_080352.jpg|4
-WhatsApp Image 2026-11-09 at 11.14.53 PM (1).jpeg|1
-WhatsApp Image 2026-11-09 at 11.14.53 PM.jpeg|2
-WhatsApp Image 2026-11-09 at 11.14.54 PM.jpeg|10
-WhatsApp Image 2026-11-09 at 11.14.55 PM (1).jpeg|1
-WhatsApp Image 2026-11-09 at 11.14.55 PM.jpeg|1
 WhatsApp Image 2026-11-09 at 11.18.23 PM.jpeg|10
+WhatsApp Image 2026-11-22 at 2.34.27 PM.jpeg|6
+WhatsApp Image 2026-11-22 at 3.36.48 PM.jpeg|3
+WhatsApp Image 2026-11-22 at 3.47.07 PM (1).jpeg|10
+WhatsApp Image 2026-11-22 at 3.47.07 PM.jpeg|11
+WhatsApp Image 2026-11-22 at 3.47.20 PM.jpeg|5
+WhatsApp Image 2026-11-22 at 3.49.44 PM.jpeg|12
+WhatsApp Image 2026-11-22 at 3.51.08 PM.jpeg|4
+WhatsApp Image 2026-11-22 at 3.58.32 PM.jpeg|1
+WhatsApp Image 2026-11-22 at 3.58.32 PM (2).jpeg|2
+WhatsApp Image 2026-11-22 at 3.58.32 PM (3).jpeg|5
+WhatsApp Image 2026-11-22 at 5.32.38 PM.jpeg|5
+WhatsApp Image 2026-11-22 at 5.32.39 PM.jpeg|2

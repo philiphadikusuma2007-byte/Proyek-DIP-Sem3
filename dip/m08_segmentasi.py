@@ -1,136 +1,140 @@
 # =============================================================================
-# m08_segmentasi.py  -  Materi 08 Image Segmentation
-#   - Deteksi tepi Sobel:  grad f = |Gx| + |Gy|
-#       Gx = -Z1 - 2Z2 - Z3 + Z7 + 2Z8 + Z9,  Gy = -Z1 - 2Z4 - Z7 + Z3 + 2Z6 + Z9
-#   - Thresholding: piksel > T -> objek. T dipilih dari histogram.
-#     Otsu = cara memilih T otomatis (Gonzalez, DI LUAR slide).
-#   - Region growing: mulai dari seed, tambahkan tetangga yang mirip.
-#   - Pelabelan region dengan konektivitas N4 / N8 (02 Intro II).
+# dip/m08_segmentasi.py  -  Materi 08 Image Segmentation (+ konektivitas 02)
+#
+#   * Thresholding: piksel > T -> objek (single thresholding, slide 08).
+#     T dipilih dari histogram. Cara memilih T otomatis = metode OTSU
+#     (buku Gonzalez, DI LUAR slide): murni rumus statistik histogram,
+#     tanpa data latih / tanpa "belajar" -> bukan machine learning.
+#   * Pelabelan region (connected component): piksel objek yang saling
+#     terhubung N4 atau N8 (slide 02 "Connectivity") diberi nomor yang sama.
+#   * Region growing (slide 08): mulai dari seed, region membesar dengan
+#     menambahkan piksel tetangga yang sifatnya hampir sama.
+#
+# File ini TIDAK meng-import library apa pun.
 # =============================================================================
-import numpy as np
-
-from dip.m03_spasial import konvolusi, SOBEL_H1, SOBEL_H2, filter_maksimum
-
-
-def sobel(abu):
-    # besar gradien = |Gx| + |Gy|  (rumus slide 08)
-    gx = konvolusi(abu, SOBEL_H1)
-    gy = konvolusi(abu, SOBEL_H2)
-    gx[gx < 0] = -gx[gx < 0]
-    gy[gy < 0] = -gy[gy < 0]
-    return gx + gy
 
 
 def otsu(hist):
-    # [DI LUAR SLIDE - Gonzalez] Otsu: pilih T yang membuat dua kelas
-    # (<= T dan > T) paling terpisah = variansi antar-kelas terbesar:
-    #   sigma_B^2(T) = n_bawah * n_atas * (rata_bawah - rata_atas)^2
+    # [Gonzalez - Otsu] Pilih T (0..255) yang membuat dua kelas
+    #   kelas 1: piksel <= T     kelas 2: piksel > T
+    # paling terpisah, yaitu variansi ANTAR-kelas terbesar:
+    #   sigma_B^2(T) = w1(T) * w2(T) * (mu1(T) - mu2(T))^2
+    # w = proporsi piksel tiap kelas, mu = rata-rata tiap kelas.
     n = 0
     total = 0
-    for i in range(256):
-        n += hist[i]
-        total += i * hist[i]
-
-    terbaik = 0
+    for k in range(256):
+        n += hist[k]
+        total += k * hist[k]
+    if n == 0:
+        return 128
+    terbaik = -1.0
     batas = 0
-    n_bawah = 0
-    total_bawah = 0
+    n1 = 0
+    total1 = 0
     for t in range(256):
-        n_bawah += hist[t]
-        if n_bawah == 0:
+        n1 += hist[t]
+        total1 += t * hist[t]
+        n2 = n - n1
+        if n1 == 0:
             continue
-        n_atas = n - n_bawah
-        if n_atas == 0:
+        if n2 == 0:
             break
-        total_bawah += t * hist[t]
-        rata_bawah = total_bawah / n_bawah
-        rata_atas = (total - total_bawah) / n_atas
-        beda = rata_bawah - rata_atas
-        variansi = n_bawah * n_atas * beda * beda
-        if variansi > terbaik:
-            terbaik = variansi
+        mu1 = total1 / n1
+        mu2 = (total - total1) / n2
+        sb = (n1 / n) * (n2 / n) * (mu1 - mu2) * (mu1 - mu2)
+        if sb > terbaik:
+            terbaik = sb
             batas = t
     return batas
 
 
-def tetangga(konektivitas):
-    # N4(p): atas, bawah, kiri, kanan.  N8(p) = N4(p) + 4 diagonal (ND)
-    n4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    if konektivitas == 4:
-        return n4
-    return n4 + [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-
-def label_region(mask, konektivitas=4):
-    # Pelabelan region: setiap kelompok piksel 1 yang tersambung (N4 / N8)
-    # diberi nomor. Memakai tumpukan (stack) = flood fill.
-    # Hasil: peta label + daftar region (luas, kotak pembatas, daftar piksel).
-    tinggi = mask.shape[0]
-    lebar = mask.shape[1]
-    arah = tetangga(konektivitas)
-    data = (mask > 0.5).tolist()
-    label = []
+def label_region(mask, lebar, tinggi, konektivitas=8):
+    # Pelabelan region: setiap kelompok piksel bernilai 1 yang tersambung
+    # (N4 atau N8) diberi nomor 1, 2, 3, ...  Memakai tumpukan (stack) =
+    # flood fill. Gambar diberi bingkai 0 selebar 1 piksel supaya tetangga
+    # di tepi tidak perlu dicek batasnya.
+    L = lebar + 2
+    pad = [0] * (L * (tinggi + 2))
     for y in range(tinggi):
-        label.append([0] * lebar)
-
+        pad[(y + 1) * L + 1:(y + 1) * L + 1 + lebar] = mask[y * lebar:(y + 1) * lebar]
+    if konektivitas == 4:
+        arah = (-L, L, -1, 1)                                   # N4(p)
+    else:
+        arah = (-L, L, -1, 1, -L - 1, -L + 1, L - 1, L + 1)     # N8(p) = N4 + ND
+    label = [0] * len(pad)
     daftar = []
     nomor = 0
-    for y in range(tinggi):
-        for x in range(lebar):
-            if data[y][x] and label[y][x] == 0:
-                nomor += 1
-                label[y][x] = nomor
-                tumpukan = [(y, x)]
-                piksel = []
+    for awal in range(len(pad)):
+        if pad[awal] == 0 or label[awal] != 0:
+            continue
+        nomor += 1
+        label[awal] = nomor
+        tumpukan = [awal]
+        piksel = []
+        while tumpukan:
+            p = tumpukan.pop()
+            piksel.append(p)
+            for d in arah:
+                q = p + d
+                if pad[q] and not label[q]:
+                    label[q] = nomor
+                    tumpukan.append(q)
+        # indeks berbingkai -> indeks gambar asli, sekaligus kotak pembatas
+        asli = []
+        x0 = lebar
+        y0 = tinggi
+        x1 = -1
+        y1 = -1
+        for p in piksel:
+            y = p // L - 1
+            x = p % L - 1
+            asli.append(y * lebar + x)
+            if x < x0:
                 x0 = x
+            if x > x1:
                 x1 = x
+            if y < y0:
                 y0 = y
+            if y > y1:
                 y1 = y
-                while len(tumpukan) > 0:
-                    py, px = tumpukan.pop()
-                    piksel.append((py, px))
-                    if px < x0:
-                        x0 = px
-                    if px > x1:
-                        x1 = px
-                    if py < y0:
-                        y0 = py
-                    if py > y1:
-                        y1 = py
-                    for (dy, dx) in arah:
-                        ny = py + dy
-                        nx = px + dx
-                        if ny >= 0 and ny < tinggi and nx >= 0 and nx < lebar:
-                            if data[ny][nx] and label[ny][nx] == 0:
-                                label[ny][nx] = nomor
-                                tumpukan.append((ny, nx))
-                daftar.append({"nomor": nomor, "luas": len(piksel), "piksel": piksel,
-                               "x0": x0, "x1": x1, "y0": y0, "y1": y1})
-    return np.array(label), daftar
+        daftar.append({"nomor": nomor, "luas": len(asli), "piksel": asli,
+                       "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+    peta = []
+    for y in range(tinggi):
+        peta.extend(label[(y + 1) * L + 1:(y + 1) * L + 1 + lebar])
+    return peta, daftar
 
 
-def region_terbesar(mask):
-    # simpan hanya region dengan luas terbesar
-    label, daftar = label_region(mask)
-    hasil = np.zeros(mask.shape)
-    if len(daftar) == 0:
-        return hasil
-    besar = daftar[0]
-    for d in daftar:
-        if d["luas"] > besar["luas"]:
-            besar = d
-    for (y, x) in besar["piksel"]:
-        hasil[y, x] = 1
+def mask_dari_region(daftar_region, lebar, tinggi):
+    # gambar biner yang berisi region-region terpilih
+    m = [0] * (lebar * tinggi)
+    for d in daftar_region:
+        for i in d["piksel"]:
+            m[i] = 1
+    return m
+
+
+def region_growing(seed, boleh, lebar, tinggi):
+    # Region growing (slide 08): region mulai dari piksel seed (mask 0/1),
+    # lalu berulang kali menambah tetangga N8 yang memenuhi syarat
+    # kemiripan (mask "boleh" = 1). Berhenti bila tidak ada lagi tetangga
+    # yang memenuhi syarat.
+    hasil = list(seed)
+    tumpukan = [i for i in range(len(seed)) if seed[i]]
+    while tumpukan:
+        p = tumpukan.pop()
+        x = p % lebar
+        y = p // lebar
+        for dy in (-1, 0, 1):
+            ny = y + dy
+            if ny < 0 or ny >= tinggi:
+                continue
+            for dx in (-1, 0, 1):
+                nx = x + dx
+                if nx < 0 or nx >= lebar:
+                    continue
+                q = ny * lebar + nx
+                if boleh[q] and not hasil[q]:
+                    hasil[q] = 1
+                    tumpukan.append(q)
     return hasil
-
-
-def region_growing(seed, boleh, langkah):
-    # Region growing: region mulai dari seed (mask 0/1), lalu berulang kali
-    # menambah tetangga N8 yang MEMENUHI kriteria kemiripan (mask "boleh").
-    # Setiap putaran = region melebar 1 piksel.
-    region = seed.copy()
-    for i in range(langkah):
-        baru = filter_maksimum(region, 3) * boleh
-        baru[seed > 0.5] = 1
-        region = baru
-    return region
